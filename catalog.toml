@@ -1,0 +1,91 @@
+# The known RGW issues that leave artifacts rgw-integrity can find.
+#
+# id:      the name findings use for the cause
+# tracker: the tracker.ceph.com issue
+# fix:     the ceph/ceph pull request that fixes it
+# min/max: the major versions that have the bug ( 18 reef, 19 squid,
+#          20 tentacle, 21 main )
+#
+# A deployment can extend this with --catalog; issues there replace the
+# built-in ones of the same id.
+
+[[issue]]
+id = "mp-meta-left"
+tracker = 80896
+fix = 72103
+what = "a completion's meta object outlived its head write (an RGW crash, a failed meta delete, or a completion lock that lapsed), and an abort or a retried completion then freed the parts"
+
+[[issue]]
+id = "lc-abort"
+tracker = 80895
+fix = 72099
+what = "lifecycle's AbortIncompleteMultipartUpload freed the parts of an upload while it was being completed"
+
+[[issue]]
+id = "abort-race"
+fix = 60771
+max = 19
+what = "AbortMultipartUpload freed the parts of an upload while it was being completed (it takes the completion lock from tentacle on)"
+
+[[issue]]
+id = "copy-self"
+tracker = 80900
+fix = 72101
+what = "a copy of an object onto itself raced an overwrite, and wrote back a manifest whose tail the overwrite had freed"
+
+[[issue]]
+id = "ix-fail"
+tracker = 80902
+fix = 72098
+min = 21
+what = "a failed bucket index completion undid a write that had taken effect"
+
+[[issue]]
+id = "stale-entry"
+tracker = 80894
+fix = 72097
+what = "bucket index completions applied out of order left an older entry in place"
+
+[[issue]]
+id = "stalled-write"
+tracker = 80903
+fix = 72102
+what = "a write that stalled past rgw_pending_bucket_index_op_expiration lost its index entry"
+
+[[issue]]
+id = "refused-complete"
+tracker = 80907
+fix = 72109
+what = "a refused conditional CompleteMultipartUpload dropped its parts' index entries"
+
+[[issue]]
+id = "lost-complete"
+tracker = 80897
+fix = 72098
+what = "a CompleteMultipartUpload that lost the race for the head left its parts behind"
+
+[[issue]]
+id = "delete-race"
+tracker = 80898
+fix = 72100
+min = 20
+what = "a DeleteObject racing an overwrite removed the new head and left its tail"
+
+[[issue]]
+id = "cond-delete"
+tracker = 80898
+fix = 72100
+min = 20
+what = "a conditional DeleteObject racing an overwrite removed the new head and left its tail"
+
+[[issue]]
+id = "lost-copy"
+tracker = 80899
+fix = 72098
+what = "a CopyObject that lost the race for the head kept its references on the source's tail"
+
+[[issue]]
+id = "dedup"
+tracker = 80901
+min = 20
+what = "dedup raced a write, delete or copy of the object"
