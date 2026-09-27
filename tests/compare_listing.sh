@@ -16,8 +16,7 @@
 #   - it lists the heads of delete markers, which do not exist
 #   - it names the shared head ( OLH ) of a versioned key starting with '_'
 #     from the key's escaped index name: an object that does not exist, in
-#     place of the one that does ( so orphan lists built on radoslist name
-#     that OLH, and gap lists a missing object )
+#     place of the one that does ( so rgw-gap-list reports a missing object )
 set -euo pipefail
 B=${CEPH_BUILD:?set CEPH_BUILD to a vstart build directory}
 T=$(cd "$(dirname "$0")" && pwd)

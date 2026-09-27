@@ -106,8 +106,9 @@ radoslist is wrong:
   ( `RGWRadosList::run` returns before `do_incomplete_multipart` ).
 - For a versioned key starting with `_`, radoslist names the key's OLH
   from its escaped index name: an object that does not exist, instead of the
-  one that does.  Orphan lists built on radoslist report that OLH as an
-  orphan, and gap lists report a missing object.
+  one that does.  rgw-gap-list reports a missing object for it
+  ( rgw-orphan-list sets objects with locators aside, so it does not call
+  the OLH an orphan ).
 
 `--radoslist` ( or the dashboard's radoslist box ) lists with radosgw-admin
 instead, a unit per bucket.
