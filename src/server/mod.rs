@@ -3,9 +3,10 @@
 //! findings, and serves the dashboard.
 
 pub mod db;
+pub mod oidc;
 pub mod web;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -47,7 +48,24 @@ pub struct App {
     /// orphan detection's sizing, instead of the objects' count
     pub partitions: Option<u32>,
     pub slices: Option<usize>,
+    pub oidc: Option<oidc::Oidc>,
+    /// only single sign-on logs in to the dashboard, not the admin token
+    pub oidc_only: bool,
+    /// the server's URL, as browsers reach it
+    pub public_url: Option<String>,
+    sessions: std::sync::Mutex<HashMap<String, Session>>,
 }
+
+/// A dashboard login.
+#[derive(Clone)]
+pub struct Session {
+    pub who: oidc::Identity,
+    expires: std::time::Instant,
+    /// the ID token, for the provider's logout
+    pub id_token: Option<String>,
+}
+
+const SESSION_HOURS: u64 = 12;
 
 pub type Shared = Arc<App>;
 
@@ -96,21 +114,36 @@ impl FromRequestParts<Shared> for ClientAuth {
     }
 }
 
-/// A request with the admin token, as a bearer token or the session cookie.
-pub struct AdminAuth;
+/// A request from someone allowed to administer: the admin token, a
+/// provider's access token as a bearer token, or a dashboard session.
+pub struct AdminAuth(pub oidc::Identity);
+
+fn wants_html(parts: &Parts) -> bool {
+    parts.headers.get(axum::http::header::ACCEPT).and_then(|a| a.to_str().ok()).is_some_and(|a| a.contains("text/html"))
+}
 
 impl FromRequestParts<Shared> for AdminAuth {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Response> {
-        let ok = bearer(parts).is_some_and(|t| token_matches(t, &app.admin_token))
-            || session(parts).is_some_and(|t| token_matches(&t, &app.admin_token));
-        if ok {
-            return Ok(AdminAuth);
+        if let Some(t) = bearer(parts) {
+            if token_matches(t, &app.admin_token) {
+                return Ok(AdminAuth(oidc::Identity { name: "admin token".into(), via: "token", groups: Vec::new() }));
+            }
+            if let (Some(o), 2) = (&app.oidc, t.matches('.').count()) {
+                return match o.verify_access_token(t).await {
+                    Ok(who) => Ok(AdminAuth(who)),
+                    Err(oidc::Refusal::NotAllowed(name)) => Err((StatusCode::FORBIDDEN, format!("{name} is not allowed here")).into_response()),
+                    Err(oidc::Refusal::Failed(e)) => Err((StatusCode::UNAUTHORIZED, format!("{e:#}")).into_response()),
+                };
+            }
+            return Err(StatusCode::UNAUTHORIZED.into_response());
+        }
+        if let Some(s) = session(parts).and_then(|id| app.session(&id)) {
+            return Ok(AdminAuth(s.who));
         }
         // browsers go to the login page; API callers get a 401
-        let html = parts.headers.get(axum::http::header::ACCEPT).and_then(|a| a.to_str().ok()).is_some_and(|a| a.contains("text/html"));
-        if html {
+        if wants_html(parts) {
             let next = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
             let to = format!("/login?next={}", web::urlencode(next));
             return Err(axum::response::Redirect::to(&to).into_response());
@@ -122,6 +155,33 @@ impl FromRequestParts<Shared> for AdminAuth {
 impl App {
     pub fn admin_token_matches(&self, token: &str) -> bool {
         token_matches(token, &self.admin_token)
+    }
+
+    /// Log someone in: a new session's id, for its cookie.
+    pub fn new_session(&self, who: oidc::Identity, id_token: Option<String>) -> String {
+        let id = {
+            let bytes: [u8; 32] = rand::random();
+            hex::encode(bytes)
+        };
+        let expires = std::time::Instant::now() + std::time::Duration::from_secs(SESSION_HOURS * 3600);
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, s| s.expires > std::time::Instant::now());
+        sessions.insert(id.clone(), Session { who, expires, id_token });
+        id
+    }
+
+    pub fn session(&self, id: &str) -> Option<Session> {
+        self.sessions.lock().unwrap().get(id).filter(|s| s.expires > std::time::Instant::now()).cloned()
+    }
+
+    pub fn end_session(&self, id: &str) -> Option<Session> {
+        self.sessions.lock().unwrap().remove(id)
+    }
+
+    pub fn session_cookie(&self, id: &str, max_age: u64) -> String {
+        let secure = if self.secure_cookies { "; Secure" } else { "" };
+        // Lax: the session must arrive with the redirect back from the provider
+        format!("{SESSION_COOKIE}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
     }
 
     pub async fn settings(&self) -> Result<Settings> {
@@ -413,8 +473,10 @@ fn yes() -> bool {
     true
 }
 
-async fn api_start(_: AdminAuth, State(app): State<Shared>, Query(q): Query<StartQuery>, Json(req): Json<StartScan>) -> ApiResult<Json<i64>> {
-    app.start_scan(req, q.gc).await.map(Json).map_err(|e| ApiError(StatusCode::CONFLICT, format!("{e:#}")))
+async fn api_start(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(q): Query<StartQuery>, Json(req): Json<StartScan>) -> ApiResult<Json<i64>> {
+    let id = app.start_scan(req, q.gc).await.map_err(|e| ApiError(StatusCode::CONFLICT, format!("{e:#}")))?;
+    app.event("scan", format!("scan {id} started by {}", who.name)).await;
+    Ok(Json(id))
 }
 
 async fn api_findings(_: AdminAuth, State(app): State<Shared>, Query(filter): Query<Filter>) -> ApiResult<Json<serde_json::Value>> {
@@ -422,8 +484,8 @@ async fn api_findings(_: AdminAuth, State(app): State<Shared>, Query(filter): Qu
     Ok(Json(serde_json::json!({ "total": total, "findings": rows })))
 }
 
-async fn api_settings(_: AdminAuth, State(app): State<Shared>, Json(s): Json<Settings>) -> ApiResult<StatusCode> {
-    let msg = format!("settings: {}", serde_json::to_string(&s).unwrap_or_default());
+async fn api_settings(AdminAuth(who): AdminAuth, State(app): State<Shared>, Json(s): Json<Settings>) -> ApiResult<StatusCode> {
+    let msg = format!("settings, by {}: {}", who.name, serde_json::to_string(&s).unwrap_or_default());
     app.db.call(move |c| db::save_settings(c, &s)).await?;
     app.event("control", msg).await;
     Ok(StatusCode::NO_CONTENT)
@@ -436,7 +498,7 @@ async fn api_status(_: AdminAuth, State(app): State<Shared>) -> ApiResult<Json<s
 }
 
 /// Findings from elsewhere: rgw-integrity scan, or rgw-gap-list.py, as JSON lines.
-async fn api_import(_: AdminAuth, State(app): State<Shared>, body: String) -> ApiResult<Json<usize>> {
+async fn api_import(AdminAuth(who): AdminAuth, State(app): State<Shared>, body: String) -> ApiResult<Json<usize>> {
     let findings: Vec<Finding> = body
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -454,7 +516,7 @@ async fn api_import(_: AdminAuth, State(app): State<Shared>, body: String) -> Ap
             Ok(())
         })
         .await?;
-    app.event("import", format!("{n} findings imported")).await;
+    app.event("import", format!("{n} findings imported by {}", who.name)).await;
     Ok(Json(n))
 }
 
@@ -510,11 +572,18 @@ pub struct ServeOpts {
     pub work_pool: Option<String>,
     pub partitions: Option<u32>,
     pub slices: Option<usize>,
+    pub oidc: Option<oidc::OidcConfig>,
+    pub oidc_only: bool,
+    pub public_url: Option<String>,
 }
 
 pub async fn serve(opts: ServeOpts, admin: Arc<Admin>, store: Option<Arc<dyn Store>>, catalog: Catalog) -> Result<()> {
     let (spec, lib) = (opts.db.clone(), opts.cephsqlite.clone());
     let db = tokio::task::spawn_blocking(move || Db::open(&spec, &lib)).await??;
+    let oidc = match opts.oidc {
+        Some(cfg) => Some(oidc::Oidc::discover(cfg).await.context("single sign-on")?),
+        None => None,
+    };
     let app = Arc::new(App {
         db,
         admin,
@@ -528,6 +597,10 @@ pub async fn serve(opts: ServeOpts, admin: Arc<Admin>, store: Option<Arc<dyn Sto
         work_pool: opts.work_pool,
         partitions: opts.partitions,
         slices: opts.slices,
+        oidc,
+        oidc_only: opts.oidc_only,
+        public_url: opts.public_url,
+        sessions: std::sync::Mutex::default(),
     });
     app.event("server", format!("started, state in {}", app.db.location)).await;
     tokio::spawn(app.clone().housekeeping());

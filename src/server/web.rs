@@ -13,6 +13,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
 
 use super::db::{self, Filter, FindingRow, STATUSES};
+use super::oidc::{Identity, Refusal};
 use super::{AdminAuth, ApiError, ApiResult, SESSION_COOKIE, Shared};
 use crate::finding::{Class, Confidence, Finding};
 use crate::oid::iso;
@@ -43,6 +44,8 @@ pub fn routes() -> Router<Shared> {
         .route("/static/fonts/{file}", get(font))
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout))
+        .route("/oidc/login", get(oidc_login))
+        .route("/oidc/callback", get(oidc_callback))
         .route("/", get(overview))
         .route("/findings", get(findings_page))
         .route("/findings.jsonl", get(findings_export))
@@ -132,7 +135,7 @@ fn notification(kind: &str, title: &str, subtitle: Option<&str>) -> Markup {
     }
 }
 
-fn page(title: &str, nav: Nav, refresh: Option<u32>, body: Markup) -> Markup {
+fn page(who: Option<&Identity>, title: &str, nav: Nav, refresh: Option<u32>, body: Markup) -> Markup {
     let item = |href: &str, label: &str, this: Nav| {
         html! {
             li {
@@ -171,6 +174,9 @@ fn page(title: &str, nav: Nav, refresh: Option<u32>, body: Markup) -> Markup {
                             }
                         }
                         div class="cds--header__global" {
+                            @if let Some(w) = who {
+                                span class="cds--header__menu-item" title=(format!("signed in with {}", if w.via == "oidc" { "single sign-on" } else { "the admin token" })) { (w.name) }
+                            }
                             a class="cds--header__menu-item" href="/logout" { "Log out" }
                         }
                     }
@@ -350,8 +356,15 @@ struct LoginQuery {
     msg: Option<String>,
 }
 
-async fn login_page(Query(q): Query<LoginQuery>) -> Markup {
+/// Only local paths, so a login cannot send the browser elsewhere.
+fn local(next: Option<String>) -> String {
+    next.filter(|n| n.starts_with('/') && !n.starts_with("//")).unwrap_or_else(|| "/".into())
+}
+
+async fn login_page(State(app): State<Shared>, Query(q): Query<LoginQuery>) -> Markup {
+    let next = local(q.next.clone());
     page(
+        None,
         "Log in",
         Nav::None,
         None,
@@ -359,11 +372,21 @@ async fn login_page(Query(q): Query<LoginQuery>) -> Markup {
             div class="rgwi-login cds--tile" {
                 h1 class="rgwi-title" { "Log in" }
                 @if let Some(m) = &q.msg { (notification("error", m, None)) }
-                p class="rgwi-muted" { "The admin token is in the server's admin token file, /etc/rgw-integrity/admin.token by default." }
-                form method="post" action="/login" {
-                    input type="hidden" name="next" value=(q.next.clone().unwrap_or_else(|| "/".into()));
-                    (text_input("token", "Admin token", "", "password", ""))
-                    div class="rgwi-actions" { button class="cds--btn cds--btn--primary" type="submit" { "Log in" } }
+                @if let Some(o) = &app.oidc {
+                    div class="rgwi-actions" {
+                        a class="cds--btn cds--btn--primary" href=(format!("/oidc/login?next={}", urlencode(&next))) { "Log in with " (o.cfg.name) }
+                    }
+                }
+                @if !app.oidc_only {
+                    @if app.oidc.is_some() { p class="rgwi-muted" style="margin-top:1.5rem" { "Or with the admin token:" } }
+                    @else { p class="rgwi-muted" { "The admin token is in the server's admin token file, /etc/rgw-integrity/admin.token by default." } }
+                    form method="post" action="/login" {
+                        input type="hidden" name="next" value=(next);
+                        (text_input("token", "Admin token", "", "password", ""))
+                        div class="rgwi-actions" {
+                            button class=(if app.oidc.is_some() { "cds--btn cds--btn--tertiary" } else { "cds--btn cds--btn--primary" }) type="submit" { "Log in" }
+                        }
+                    }
                 }
             }
         },
@@ -376,33 +399,110 @@ struct LoginForm {
     next: Option<String>,
 }
 
-async fn login(State(app): State<Shared>, Form(f): Form<LoginForm>) -> Response {
-    // only local paths, so the login cannot redirect elsewhere
-    let next = f.next.filter(|n| n.starts_with('/') && !n.starts_with("//")).unwrap_or_else(|| "/".into());
-    if !app.admin_token_matches(f.token.trim()) {
-        return Redirect::to(&format!("/login?next={}&msg={}", urlencode(&next), urlencode("That is not the admin token."))).into_response();
-    }
-    let secure = if app.secure_cookies { "; Secure" } else { "" };
-    let cookie = format!("{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200{secure}", f.token.trim());
-    let mut resp = Redirect::to(&next).into_response();
-    match HeaderValue::from_str(&cookie) {
-        Ok(v) => {
-            resp.headers_mut().insert(header::SET_COOKIE, v);
+fn with_cookies(mut resp: Response, cookies: &[String]) -> Response {
+    for c in cookies {
+        if let Ok(v) = HeaderValue::from_str(c) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
         }
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     }
     resp
 }
 
-async fn logout() -> Response {
-    let mut resp = Redirect::to("/login").into_response();
-    resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("rgwi_session=; Path=/; Max-Age=0"));
-    resp
+async fn login(State(app): State<Shared>, Form(f): Form<LoginForm>) -> Response {
+    let next = local(f.next);
+    if app.oidc_only || !app.admin_token_matches(f.token.trim()) {
+        return Redirect::to(&format!("/login?next={}&msg={}", urlencode(&next), urlencode("That is not the admin token."))).into_response();
+    }
+    let who = Identity { name: "admin token".into(), via: "token", groups: Vec::new() };
+    let id = app.new_session(who, None);
+    app.event("login", "logged in with the admin token".into()).await;
+    with_cookies(Redirect::to(&next).into_response(), &[app.session_cookie(&id, super::SESSION_HOURS * 3600)])
+}
+
+const OIDC_STATE_COOKIE: &str = "rgwi_oidc";
+
+async fn oidc_login(State(app): State<Shared>, Query(q): Query<LoginQuery>) -> Response {
+    let Some(o) = &app.oidc else { return StatusCode::NOT_FOUND.into_response() };
+    match o.begin(&local(q.next)) {
+        Ok((url, state)) => {
+            let secure = if app.secure_cookies { "; Secure" } else { "" };
+            // binds the provider's answer to this browser; Lax, as it comes back from the provider
+            let cookie = format!("{OIDC_STATE_COOKIE}={state}; Path=/oidc; HttpOnly; SameSite=Lax; Max-Age=600{secure}");
+            with_cookies(Redirect::to(&url).into_response(), &[cookie])
+        }
+        Err(e) => Redirect::to(&format!("/login?msg={}", urlencode(&format!("{e:#}")))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct Callback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    let all = headers.get(header::COOKIE)?.to_str().ok()?;
+    all.split(';').filter_map(|c| c.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+}
+
+async fn oidc_callback(State(app): State<Shared>, headers: axum::http::HeaderMap, Query(cb): Query<Callback>) -> Response {
+    let Some(o) = &app.oidc else { return StatusCode::NOT_FOUND.into_response() };
+    let fail = |msg: String| Redirect::to(&format!("/login?msg={}", urlencode(&msg))).into_response();
+    if let Some(e) = cb.error {
+        return fail(format!("The provider refused the login: {e} {}", cb.error_description.unwrap_or_default()));
+    }
+    let (Some(code), Some(state)) = (cb.code, cb.state) else { return fail("The provider's answer has no code.".into()) };
+    if cookie(&headers, OIDC_STATE_COOKIE).as_deref() != Some(state.as_str()) {
+        return fail("This login did not start in this browser; log in again.".into());
+    }
+    let clear = format!("{OIDC_STATE_COOKIE}=; Path=/oidc; Max-Age=0");
+    match o.finish(&state, &code).await {
+        Ok((who, next, id_token)) => {
+            app.event("login", format!("{} logged in with single sign-on", who.name)).await;
+            let id = app.new_session(who, Some(id_token));
+            with_cookies(Redirect::to(&next).into_response(), &[app.session_cookie(&id, super::SESSION_HOURS * 3600), clear])
+        }
+        Err(Refusal::NotAllowed(name)) => {
+            app.event("login", format!("{name} was refused: not an allowed user or group")).await;
+            let body = page(
+                None,
+                "Not allowed",
+                Nav::None,
+                None,
+                html! {
+                    div class="rgwi-login cds--tile" {
+                        h1 class="rgwi-title" { "Not allowed" }
+                        (notification("error", &format!("{name} signed in, but is not one of the users or groups allowed here."), Some("Ask the server's administrator to allow your user or a group of yours.")))
+                        a class="cds--link" href="/login" { "Log in as someone else" }
+                    }
+                },
+            );
+            with_cookies((StatusCode::FORBIDDEN, body).into_response(), &[clear])
+        }
+        Err(Refusal::Failed(e)) => {
+            tracing::error!("single sign-on: {e:#}");
+            with_cookies(fail(format!("{e:#}")), &[clear])
+        }
+    }
+}
+
+async fn logout(State(app): State<Shared>, headers: axum::http::HeaderMap) -> Response {
+    let ended = cookie(&headers, SESSION_COOKIE).and_then(|id| app.end_session(&id));
+    let clear = app.session_cookie("", 0);
+    // leave the provider's session too, and come back to the login page
+    if let (Some(o), Some(token), Some(public)) = (&app.oidc, ended.as_ref().and_then(|s| s.id_token.clone()), app.public_url.as_deref()) {
+        if let Some(url) = o.logout_url(&token, &format!("{}/login", public.trim_end_matches('/'))) {
+            return with_cookies(Redirect::to(&url).into_response(), &[clear]);
+        }
+    }
+    with_cookies(Redirect::to("/login").into_response(), &[clear])
 }
 
 // ---- overview
 
-async fn overview(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
+async fn overview(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
     let active = Filter { status: Some("active".into()), ..Default::default() };
     let (facets, scans, clients, events, settings) = app
         .db
@@ -411,6 +511,7 @@ async fn overview(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<Flas
     let live = clients.iter().filter(|c| c.last_seen >= now() - 30).count();
     let running = scans.first().filter(|s| s.state == "running");
     Ok(page(
+        Some(&who),
         "Overview",
         Nav::Overview,
         Some(10),
@@ -561,7 +662,7 @@ fn distinct_causes(c: &rusqlite::Connection) -> anyhow::Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-async fn findings_page(_: AdminAuth, State(app): State<Shared>, Query(q): Query<FindingsQuery>) -> ApiResult<Markup> {
+async fn findings_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(q): Query<FindingsQuery>) -> ApiResult<Markup> {
     let filter = q.filter();
     let f2 = filter.clone();
     let (rows, total, facets, causes) = app
@@ -585,6 +686,7 @@ async fn findings_page(_: AdminAuth, State(app): State<Shared>, Query(q): Query<
     let fl = Flash { msg: q.msg.clone(), kind: q.kind.clone() };
     let tally = |m: &std::collections::BTreeMap<String, u64>| m.iter().map(|(k, v)| (k.clone(), *v as i64)).collect::<Vec<_>>();
     Ok(page(
+        Some(&who),
         "Findings",
         Nav::Findings,
         None,
@@ -646,7 +748,7 @@ async fn findings_page(_: AdminAuth, State(app): State<Shared>, Query(q): Query<
     ))
 }
 
-async fn findings_export(_: AdminAuth, State(app): State<Shared>, Query(q): Query<FindingsQuery>) -> ApiResult<Response> {
+async fn findings_export(AdminAuth(_who): AdminAuth, State(app): State<Shared>, Query(q): Query<FindingsQuery>) -> ApiResult<Response> {
     let mut filter = q.filter();
     let body = app
         .db
@@ -691,13 +793,14 @@ fn finding_detail(r: &FindingRow) -> Markup {
     }
 }
 
-async fn finding_page(_: AdminAuth, State(app): State<Shared>, Path(id): Path<i64>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
+async fn finding_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id): Path<i64>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
     let Some(r) = app.db.call(move |c| db::finding(c, id)).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("no finding {id}")));
     };
     let f = &r.finding;
     let statuses: Vec<(String, String)> = ["open", "confirmed", "false_positive"].iter().map(|s| (s.to_string(), s.replace('_', " "))).collect();
     Ok(page(
+        Some(&who),
         &format!("Finding {id}"),
         Nav::Findings,
         None,
@@ -753,8 +856,8 @@ struct StatusForm {
     note: Option<String>,
 }
 
-async fn finding_status(_: AdminAuth, State(app): State<Shared>, Path(id): Path<i64>, Form(f): Form<StatusForm>) -> Response {
-    let msg = format!("finding {id}: {}", f.status);
+async fn finding_status(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id): Path<i64>, Form(f): Form<StatusForm>) -> Response {
+    let msg = format!("finding {id}: {}, by {}", f.status, who.name);
     match app.db.call(move |c| db::set_status(c, id, &f.status, f.note.as_deref())).await {
         Ok(_) => {
             app.event("triage", msg).await;
@@ -766,10 +869,11 @@ async fn finding_status(_: AdminAuth, State(app): State<Shared>, Path(id): Path<
 
 // ---- clients
 
-async fn clients_page(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
+async fn clients_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
     let (clients, settings) = app.db.call(|c| Ok((db::clients(c)?, db::settings(c)?))).await?;
     let live_count = clients.iter().filter(|c| c.last_seen >= now() - 30).count();
     Ok(page(
+        Some(&who),
         "Clients",
         Nav::Clients,
         Some(10),
@@ -829,7 +933,7 @@ async fn clients_page(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<
     ))
 }
 
-async fn controls(_: AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap<String, String>>) -> Response {
+async fn controls(AdminAuth(who): AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap<String, String>>) -> Response {
     let result: anyhow::Result<String> = async {
         let mut s = app.settings().await?;
         let msg = match f.get("action").map(String::as_str) {
@@ -862,7 +966,7 @@ async fn controls(_: AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap
         };
         let s2 = s.clone();
         app.db.call(move |c| db::save_settings(c, &s2)).await?;
-        app.event("control", msg.clone()).await;
+        app.event("control", format!("{msg} ( by {} )", who.name)).await;
         Ok(msg)
     }
     .await;
@@ -872,11 +976,11 @@ async fn controls(_: AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap
     }
 }
 
-async fn client_override(_: AdminAuth, State(app): State<Shared>, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
+async fn client_override(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
     let v = f.get("inflight").filter(|v| !v.trim().is_empty()).and_then(|v| v.trim().parse::<usize>().ok()).map(|v| v.max(1));
     let msg = match v {
-        Some(n) => format!("{id}: its own limit of {n} in flight"),
-        None => format!("{id}: an equal share"),
+        Some(n) => format!("{id}: its own limit of {n} in flight, by {}", who.name),
+        None => format!("{id}: an equal share, by {}", who.name),
     };
     let id2 = id.clone();
     match app.db.call(move |c| db::set_override(c, &id2, v)).await {
@@ -888,9 +992,12 @@ async fn client_override(_: AdminAuth, State(app): State<Shared>, Path(id): Path
     }
 }
 
-async fn forget_clients(_: AdminAuth, State(app): State<Shared>) -> Response {
+async fn forget_clients(AdminAuth(who): AdminAuth, State(app): State<Shared>) -> Response {
     match app.db.call(|c| db::forget_clients(c, now() - 3600)).await {
-        Ok(n) => back("/clients", &format!("Forgot {n} clients."), false).into_response(),
+        Ok(n) => {
+            app.event("control", format!("{n} clients forgotten, by {}", who.name)).await;
+            back("/clients", &format!("Forgot {n} clients."), false).into_response()
+        }
         Err(e) => back("/clients", &format!("{e:#}"), true).into_response(),
     }
 }
@@ -954,10 +1061,11 @@ fn state_color(state: &str) -> &'static str {
     }
 }
 
-async fn scans_page(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
+async fn scans_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
     let (scans, settings) = app.db.call(|c| Ok((db::scans(c, 50)?, db::settings(c)?))).await?;
     let running = scans.iter().find(|s| s.state == "running");
     Ok(page(
+        Some(&who),
         "Scans",
         Nav::Scans,
         Some(10),
@@ -1013,7 +1121,7 @@ async fn scans_page(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<Fl
     ))
 }
 
-async fn start_scan(_: AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap<String, String>>) -> Response {
+async fn start_scan(AdminAuth(who): AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap<String, String>>) -> Response {
     let options = match options_of(&f) {
         Ok(o) => o,
         Err(e) => return back("/scans", &format!("{e:#}"), true).into_response(),
@@ -1021,15 +1129,18 @@ async fn start_scan(_: AdminAuth, State(app): State<Shared>, Form(f): Form<HashM
     let buckets = f.get("buckets").map(|b| b.split_whitespace().map(str::to_string).collect()).unwrap_or_default();
     let req = StartScan { options, buckets, note: f.get("note").cloned().unwrap_or_default() };
     match app.start_scan(req, f.contains_key("gc")).await {
-        Ok(id) => back("/scans", &format!("Scan {id} started."), false).into_response(),
+        Ok(id) => {
+            app.event("scan", format!("scan {id} started by {}", who.name)).await;
+            back("/scans", &format!("Scan {id} started."), false).into_response()
+        }
         Err(e) => back("/scans", &format!("{e:#}"), true).into_response(),
     }
 }
 
-async fn cancel_scan(_: AdminAuth, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+async fn cancel_scan(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.call(move |c| db::cancel_scan(c, id, now())).await {
         Ok(()) => {
-            app.event("scan", format!("scan {id} cancelled")).await;
+            app.event("scan", format!("scan {id} cancelled by {}", who.name)).await;
             back("/scans", &format!("Scan {id} cancelled."), false).into_response()
         }
         Err(e) => back("/scans", &format!("{e:#}"), true).into_response(),
@@ -1041,13 +1152,14 @@ struct UnitsQuery {
     state: Option<String>,
 }
 
-async fn scan_page(_: AdminAuth, State(app): State<Shared>, Path(id): Path<i64>, Query(q): Query<UnitsQuery>) -> ApiResult<Markup> {
+async fn scan_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id): Path<i64>, Query(q): Query<UnitsQuery>) -> ApiResult<Markup> {
     let state = q.state.clone().filter(|s| !s.is_empty());
     let st2 = state.clone();
     let (units, scans) = app.db.call(move |c| Ok((db::units(c, id, st2.as_deref(), 2000)?, db::scans(c, 1000)?))).await?;
     let Some(s) = scans.into_iter().find(|s| s.id == id) else { return Err(ApiError(StatusCode::NOT_FOUND, format!("no scan {id}"))) };
     let states = pairs(&[("", "Any"), ("leased", "leased"), ("pending", "pending"), ("done", "done"), ("failed", "failed"), ("cancelled", "cancelled")]);
     Ok(page(
+        Some(&who),
         &format!("Scan {id}"),
         Nav::Scans,
         (s.state == "running").then_some(10),
@@ -1089,10 +1201,11 @@ async fn scan_page(_: AdminAuth, State(app): State<Shared>, Path(id): Path<i64>,
 
 // ---- settings and issues
 
-async fn settings_page(_: AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
+async fn settings_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(fl): Query<Flash>) -> ApiResult<Markup> {
     let s = app.settings().await?;
     let releases = pairs(&[("", "from ceph versions"), ("reef", "reef (18)"), ("squid", "squid (19)"), ("tentacle", "tentacle (20)"), ("main", "main (21)")]);
     Ok(page(
+        Some(&who),
         "Settings",
         Nav::Settings,
         None,
@@ -1124,7 +1237,7 @@ async fn settings_page(_: AdminAuth, State(app): State<Shared>, Query(fl): Query
     ))
 }
 
-async fn save_settings(_: AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap<String, String>>) -> Response {
+async fn save_settings(AdminAuth(who): AdminAuth, State(app): State<Shared>, Form(f): Form<HashMap<String, String>>) -> Response {
     let result: anyhow::Result<()> = async {
         let mut s = app.settings().await?;
         s.release = f.get("release").map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
@@ -1143,7 +1256,7 @@ async fn save_settings(_: AdminAuth, State(app): State<Shared>, Form(f): Form<Ha
         }
         s.auto_scan_hours = f.get("auto_scan_hours").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
         s.default_options = options_of(&f)?;
-        let msg = format!("settings: release {:?}, fixes {:?} since {:?}, scans every {} h", s.release, s.fixed, s.fixed_since, s.auto_scan_hours);
+        let msg = format!("settings, by {}: release {:?}, fixes {:?} since {:?}, scans every {} h", who.name, s.release, s.fixed, s.fixed_since, s.auto_scan_hours);
         app.db.call(move |c| db::save_settings(c, &s)).await?;
         app.event("control", msg).await;
         Ok(())
@@ -1155,7 +1268,7 @@ async fn save_settings(_: AdminAuth, State(app): State<Shared>, Form(f): Form<Ha
     }
 }
 
-async fn issues_page(_: AdminAuth, State(app): State<Shared>) -> Markup {
+async fn issues_page(AdminAuth(who): AdminAuth, State(app): State<Shared>) -> Markup {
     let name = |m: u32| match m {
         18 => "reef",
         19 => "squid",
@@ -1164,6 +1277,7 @@ async fn issues_page(_: AdminAuth, State(app): State<Shared>) -> Markup {
         _ => "",
     };
     page(
+        Some(&who),
         "Known issues",
         Nav::Issues,
         None,

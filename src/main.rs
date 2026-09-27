@@ -90,6 +90,85 @@ struct ServerArgs {
     work_pool: Option<String>,
     #[command(flatten)]
     sizing: SizingArgs,
+    #[command(flatten)]
+    oidc: OidcArgs,
+}
+
+/// Single sign-on with OpenID Connect, for the dashboard and the admin API.
+#[derive(Args)]
+struct OidcArgs {
+    /// the provider's issuer URL; enables single sign-on
+    #[arg(long, requires_all = ["oidc_client_id", "public_url"])]
+    oidc_issuer: Option<String>,
+    #[arg(long)]
+    oidc_client_id: Option<String>,
+    /// the client's secret; without it, the client is public and relies on PKCE
+    #[arg(long)]
+    oidc_client_secret_file: Option<PathBuf>,
+    /// the server's URL as browsers reach it; the provider sends them back
+    /// to <url>/oidc/callback
+    #[arg(long)]
+    public_url: Option<String>,
+    #[arg(long, default_value = "openid profile email")]
+    oidc_scopes: String,
+    /// the claim that names the user
+    #[arg(long, default_value = "preferred_username")]
+    oidc_user_claim: String,
+    /// the claim that lists the user's groups
+    #[arg(long, default_value = "groups")]
+    oidc_groups_claim: String,
+    /// users allowed in, comma separated
+    #[arg(long, value_delimiter = ',')]
+    oidc_allowed_users: Vec<String>,
+    /// groups allowed in, comma separated
+    #[arg(long, value_delimiter = ',')]
+    oidc_allowed_groups: Vec<String>,
+    /// let in anyone the provider vouches for
+    #[arg(long)]
+    oidc_allow_any_user: bool,
+    /// the audience of the admin API's bearer tokens; the client id by default
+    #[arg(long)]
+    oidc_api_audience: Option<String>,
+    /// the CA of the provider's certificate
+    #[arg(long)]
+    oidc_ca_cert: Option<PathBuf>,
+    /// what the login button calls the provider
+    #[arg(long, default_value = "single sign-on")]
+    oidc_name: String,
+    /// log in to the dashboard only with single sign-on; the admin token
+    /// still works as the API's bearer token
+    #[arg(long, requires = "oidc_issuer")]
+    oidc_only: bool,
+}
+
+impl OidcArgs {
+    fn config(&self) -> Result<Option<server::oidc::OidcConfig>> {
+        let Some(issuer) = &self.oidc_issuer else { return Ok(None) };
+        if !self.oidc_allow_any_user && self.oidc_allowed_users.is_empty() && self.oidc_allowed_groups.is_empty() {
+            anyhow::bail!("single sign-on lets in only --oidc-allowed-users or --oidc-allowed-groups, or anyone with --oidc-allow-any-user");
+        }
+        let client_id = self.oidc_client_id.clone().expect("clap requires it");
+        let public = self.public_url.clone().expect("clap requires it");
+        let secret = match &self.oidc_client_secret_file {
+            Some(f) => Some(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?.trim().to_string()),
+            None => None,
+        };
+        Ok(Some(server::oidc::OidcConfig {
+            issuer: issuer.clone(),
+            api_audience: self.oidc_api_audience.clone().unwrap_or_else(|| client_id.clone()),
+            client_id,
+            client_secret: secret,
+            redirect_url: format!("{}/oidc/callback", public.trim_end_matches('/')),
+            scopes: self.oidc_scopes.split_whitespace().map(str::to_string).collect(),
+            user_claim: self.oidc_user_claim.clone(),
+            groups_claim: self.oidc_groups_claim.clone(),
+            allowed_users: self.oidc_allowed_users.iter().map(|u| u.trim().to_string()).collect(),
+            allowed_groups: self.oidc_allowed_groups.iter().map(|g| g.trim().to_string()).collect(),
+            allow_any_user: self.oidc_allow_any_user,
+            ca_cert: self.oidc_ca_cert.clone(),
+            name: self.oidc_name.clone(),
+        }))
+    }
 }
 
 #[derive(Args)]
@@ -638,6 +717,9 @@ async fn server(args: ServerArgs) -> Result<()> {
         work_pool,
         partitions: args.sizing.orphan_partitions,
         slices: args.sizing.orphan_slices,
+        oidc: args.oidc.config()?,
+        oidc_only: args.oidc.oidc_only,
+        public_url: args.oidc.public_url.clone(),
     };
     server::serve(opts, admin, store, Catalog::load(args.ceph.catalog.as_deref())?).await
 }

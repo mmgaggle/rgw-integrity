@@ -18,3 +18,14 @@ of ceph/ceph#72096 ( build the `vstart` and `ceph-diff-sorted` targets ):
 ```
 CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json PYTHON=~/venv/bin/python tests/e2e.sh
 ```
+
+- `oidc/`: single sign-on through Keycloak.  `keycloak.sh` runs one in
+  podman with realm `rgwi` ( `realm.json` ): alice is in `rgw-admins`, bob is
+  not.  Start a server on https://localhost:18443 with
+  `--public-url https://localhost:18443 --oidc-issuer http://localhost:8080/realms/rgwi --oidc-client-id rgw-integrity`
+  `--oidc-client-secret-file <( echo rgwi-test-secret ) --oidc-allowed-groups rgw-admins --oidc-name Keycloak`,
+  and run `test_oidc.py` where a browser reaches both ports:
+
+  ```
+  uv run --with playwright python tests/oidc/test_oidc.py chrome
+  ```

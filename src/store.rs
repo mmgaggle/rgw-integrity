@@ -62,6 +62,7 @@ pub trait Store: Send + Sync {
 }
 
 /// An in-memory Store, for tests.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MockStore {
     /// pool 0.. are the data pools, then the extra pools; "index" objects are
@@ -75,6 +76,7 @@ pub struct MockStore {
     pub listing: HashMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
 #[derive(Default, Clone)]
 pub struct MockObject {
     pub size: u64,
@@ -83,6 +85,7 @@ pub struct MockObject {
     pub omap: Vec<String>,
 }
 
+#[cfg(test)]
 impl MockStore {
     pub fn new(pools: usize, extra: usize) -> MockStore {
         MockStore { pools, extra, ..Default::default() }
@@ -103,6 +106,7 @@ impl MockStore {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl Store for MockStore {
     async fn stat(&self, oid: &str) -> Stat {

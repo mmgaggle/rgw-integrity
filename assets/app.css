@@ -38,3 +38,5 @@ body { background: var(--cds-background); color: var(--cds-text-primary); margin
 .cds--inline-notification { max-width: none; margin-bottom: 1rem; }
 .rgwi-refresh { display: flex; align-items: center; gap: 0.5rem; color: var(--cds-text-secondary); font-size: 0.75rem; }
 @media (max-width: 66rem) { .rgwi-cols { grid-template-columns: 1fr; } .rgwi-main { padding: 4rem 1rem 2rem; } }
+/* fields on a tile take the next layer's color, as Carbon's layering asks */
+.cds--tile .cds--text-input, .cds--tile .cds--select-input { background-color: var(--cds-field-02); }

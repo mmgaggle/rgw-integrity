@@ -1,0 +1,45 @@
+{
+  "realm": "rgwi",
+  "enabled": true,
+  "sslRequired": "none",
+  "groups": [{ "name": "rgw-admins" }, { "name": "users" }],
+  "users": [
+    {
+      "username": "alice", "enabled": true, "email": "alice@example.com", "emailVerified": true,
+      "firstName": "Alice", "lastName": "Admin",
+      "credentials": [{ "type": "password", "value": "alice-pw", "temporary": false }],
+      "groups": ["/rgw-admins"]
+    },
+    {
+      "username": "bob", "enabled": true, "email": "bob@example.com", "emailVerified": true,
+      "firstName": "Bob", "lastName": "User",
+      "credentials": [{ "type": "password", "value": "bob-pw", "temporary": false }],
+      "groups": ["/users"]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "rgw-integrity",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "rgwi-test-secret",
+      "redirectUris": ["https://localhost:18443/oidc/callback"],
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://localhost:18443/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
+          "config": { "claim.name": "groups", "full.path": "true", "id.token.claim": "true", "access.token.claim": "true", "userinfo.token.claim": "true" }
+        },
+        {
+          "name": "audience", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.client.audience": "rgw-integrity", "access.token.claim": "true", "id.token.claim": "false" }
+        }
+      ]
+    }
+  ]
+}

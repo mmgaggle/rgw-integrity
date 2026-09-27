@@ -45,6 +45,35 @@ From a vstart cluster seeded with each known race's artifact ( see `tests/` ).
 
 ![Scans](docs/screenshots/scans-dark.png)
 
+## Single sign-on
+
+The dashboard and the admin API can take logins from an OpenID Connect
+provider ( Keycloak, IBM Security Verify, Okta, Entra ID, ... ):
+
+```
+rgw-integrity server ... --public-url https://rgwi.example.com:8443 \
+  --oidc-issuer https://sso.example.com/realms/storage --oidc-client-id rgw-integrity \
+  --oidc-client-secret-file /etc/rgw-integrity/oidc.secret \
+  --oidc-allowed-groups storage-admins --oidc-name "IBM Security Verify"
+```
+
+- The login is the authorization code flow with PKCE; the server checks the
+  ID token's signature against the provider's keys, and its issuer,
+  audience, expiry and nonce.  Register `<public url>/oidc/callback` as the
+  client's redirect URI, and `<public url>/login` as its post-logout one.
+- Only `--oidc-allowed-users` and members of `--oidc-allowed-groups` ( the
+  `--oidc-groups-claim`, `groups` by default ) get in, unless
+  `--oidc-allow-any-user`.  Others are refused, and the refusal is logged.
+- The admin API takes the provider's access tokens as bearer tokens, with
+  the audience `--oidc-api-audience` ( the client id by default ) and the
+  same rules, for automation.
+- Logins are server-side sessions of 12 hours; logout ends the provider's
+  session too.  Events name who changed what.
+- `--oidc-only` removes the admin token's login from the dashboard; the
+  token still works as the API's bearer token, and clients keep theirs.
+
+![Logging in](docs/screenshots/login-dark.png)
+
 ## Orphans
 
 A scan with orphans ( `"orphans": true`, the dashboard's Orphans box, or
