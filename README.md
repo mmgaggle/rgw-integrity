@@ -19,10 +19,28 @@ findings in the same JSON format.
   each client's share of a global concurrency, and can pause them.  Leases
   lapse to other clients when a client stops.
 - `import`: findings from `scan` or `rgw-gap-list.py`, into a server.
-- The dashboard, in the IBM Carbon Design System: in progress.
+- A dashboard, in the IBM Carbon Design System, served by the server: what
+  was found, filtered by class, cause, bucket and status, with each
+  finding's evidence and triage; the clients, with the global concurrency
+  and pause; and the scans.  It follows the system's light or dark theme,
+  and needs no Internet access.
 
 Both are tested against a vstart cluster seeded with each known race's
 artifact; see `tests/`.
+
+## Dashboard
+
+From a vstart cluster seeded with each known race's artifact ( see `tests/` ).
+
+![Overview](docs/screenshots/overview.png)
+
+![Findings, in the dark theme](docs/screenshots/findings-dark.png)
+
+![A finding's causes and evidence](docs/screenshots/finding-dark.png)
+
+![Clients and their concurrency](docs/screenshots/clients.png)
+
+![Scans](docs/screenshots/scans-dark.png)
 
 ## Build
 
