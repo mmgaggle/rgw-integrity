@@ -24,7 +24,8 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
 use crate::admin::Admin;
-use crate::finding::{Catalog, Context, Finding};
+use crate::finding::{Catalog, Context};
+use crate::gaplist;
 use crate::proto::{Control, Failure, Heartbeat, LeaseRequest, Leased, Report, ScanSpec, StartScan};
 use crate::scan::{GcIndex, now};
 use crate::store::Store;
@@ -154,6 +155,19 @@ impl FromRequestParts<Shared> for AdminAuth {
     }
 }
 
+/// Normalise a scan request as the CLI does, so the scan stores the prefix it
+/// checks, and refuse what it cannot scan.
+fn check_start(req: &mut StartScan) -> Result<()> {
+    req.options.match_prefix = crate::scan::normalise_prefix(req.options.match_prefix.as_deref());
+    if req.buckets.iter().any(String::is_empty) {
+        bail!("an empty bucket name: radosgw-admin would take it for every bucket");
+    }
+    if req.options.orphans && (!req.buckets.is_empty() || req.options.match_prefix.is_some()) {
+        bail!("finding orphans needs every bucket's references: scan every bucket, and every key");
+    }
+    Ok(())
+}
+
 impl App {
     pub fn admin_token_matches(&self, token: &str) -> bool {
         token_matches(token, &self.admin_token)
@@ -215,8 +229,9 @@ impl App {
     }
 
     /// Start a scan: list the buckets, snapshot GC, and queue a unit per
-    /// bucket, or per index shard of a big one.
-    pub async fn start_scan(self: &Arc<Self>, req: StartScan, gc: bool) -> Result<i64> {
+    /// bucket, or per index shard of a big one.  A bucket bucket stats leaves
+    /// out is queued without stats, and refused with orphan detection.
+    pub async fn start_scan(self: &Arc<Self>, mut req: StartScan, gc: bool) -> Result<i64> {
         let _starting = self.starting.lock().await;
         if let Some(id) = self.db.call(|c| db::running_scan(c)).await? {
             bail!("scan {id} is still running");
@@ -224,15 +239,15 @@ impl App {
         let settings = self.settings().await?;
         let ctx = self.context(&settings).await?;
         let gc_min_wait = self.store.as_ref().and_then(|s| s.conf_get("rgw_gc_obj_min_wait")).and_then(|v| v.parse().ok()).unwrap_or(7200);
-        if req.options.orphans && (!req.buckets.is_empty() || req.options.match_prefix.is_some()) {
-            bail!("finding orphans needs every bucket's references: scan every bucket, and every key");
-        }
+        check_start(&mut req)?;
         let mut units = Vec::new();
         let mut named = std::collections::HashSet::new();
         let native = req.options.listing == crate::scan::Listing::Native;
-        let mut rx = self.admin.all_bucket_stats();
-        while let Some(st) = rx.recv().await {
-            let st = st?;
+        let all = self.admin.all_buckets().await?;
+        if req.options.orphans {
+            all.require_stats()?;
+        }
+        for st in all.stats {
             let name = st.name();
             if req.buckets.is_empty() || req.buckets.contains(&name) {
                 let json = serde_json::to_string(&st)?;
@@ -244,6 +259,16 @@ impl App {
                     });
                 }
                 named.insert(name);
+            }
+        }
+        // bucket stats left these out: the client asks again, and records why
+        let mut unstatted = 0;
+        for b in all.unstatted {
+            if req.buckets.is_empty() || req.buckets.contains(&b) {
+                crate::admin::AllBuckets::warn_unstatted(&b);
+                units.push(db::NewUnit::bucket(b.clone(), 0, None));
+                named.insert(b);
+                unstatted += 1;
             }
         }
         for b in &req.buckets {
@@ -259,16 +284,28 @@ impl App {
         let plan = if req.options.orphans { Some(self.plan_orphans(&mut units).await?) } else { None };
         let snapshot = if gc { Some(GcIndex::load(&self.admin).await?) } else { None };
         let entries = snapshot.as_ref().map_or(0, |g| g.entries);
-        let (options, note) = (req.options.clone(), req.note.clone());
+        let (mut options, note) = (req.options.clone(), req.note.clone());
+        // its clients follow no Swift large object's segments into a bucket it lists
+        options.every_bucket = req.buckets.is_empty();
         let what = match &plan {
             Some(p) => format!(", and orphans in {} partitions of {} pool slices", p.partitions, units.len() - bucket_units - p.partitions as usize),
             None => String::new(),
         };
         let shard_units = if bucket_units > buckets { format!(" in {bucket_units} units") } else { String::new() };
-        let id = self.db.call(move |c| db::insert_scan(c, now(), &options, &ctx, gc_min_wait, entries, &note, plan.as_ref(), &units)).await?;
+        let unstatted = if unstatted > 0 { format!(" ( {unstatted} with no bucket stats )") } else { String::new() };
+        let id = self
+            .db
+            .call(move |c| {
+                let id = db::insert_scan(c, now(), &options, &ctx, gc_min_wait, entries, &note, plan.as_ref(), &units)?;
+                if !gc {
+                    db::gc_missed(c, id)?;
+                }
+                Ok(id)
+            })
+            .await?;
         let json = serde_json::to_vec(&snapshot.unwrap_or_default())?;
         *self.gc.write().unwrap() = Some((id, now(), Arc::new(json)));
-        self.event("scan", format!("scan {id} started: {buckets} buckets{shard_units}{what}, {entries} GC entries")).await;
+        self.event("scan", format!("scan {id} started: {buckets} buckets{unstatted}{shard_units}{what}, {entries} GC entries")).await;
         Ok(id)
     }
 
@@ -279,9 +316,13 @@ impl App {
             bail!("finding orphans needs a pool to exchange partitions in: start the server with a ceph: database, or --work-pool");
         };
         let Some(store) = &self.store else { bail!("finding orphans needs the cluster") };
-        let pools = self.admin.zone_pools().await?.data;
+        // the pools the server stats in ( its --pool's, or the zone's ), as clients started alike do
+        let pools = store.data_pools();
+        if pools.is_empty() {
+            bail!("finding orphans needs the data pools the scan stats in, and there are none");
+        }
         let counts = store.pool_objects().await?;
-        let count = |p: &String| counts.get(p.split(':').next().unwrap_or(p)).copied().unwrap_or(0);
+        let count = |p: &String| counts.get(&crate::store::parse_pool(p).0).copied().unwrap_or(0);
         let partitions = self.partitions.unwrap_or_else(|| crate::detect::partitions_for(pools.iter().map(count).sum())).max(1);
         for pool in &pools {
             let n = self.slices.unwrap_or_else(|| crate::detect::slices_for(count(pool))).max(1);
@@ -328,24 +369,39 @@ impl App {
         }
     }
 
-    /// Let a scan's joins go once the rest is in, and close the scan when
-    /// its last unit is.
-    async fn maybe_finish(self: &Arc<Self>, scan: i64) -> Result<()> {
-        if let Some(msg) = self.db.call(move |c| db::unblock_joins(c, scan)).await? {
-            self.event("scan", msg).await;
-        }
-        if let Some(msg) = self.db.call(move |c| db::plan_classification(c, scan)).await? {
-            self.event("scan", msg).await;
-        }
-        if !self.db.call(move |c| db::scan_complete(c, scan)).await? {
-            return Ok(());
+    /// Cancel a running scan, and remove what its orphan detection left in
+    /// the work pool.  Whether it was running.
+    pub async fn cancel_scan(self: &Arc<Self>, scan: i64) -> Result<bool> {
+        if !self.db.call(move |c| db::cancel_scan(c, scan, now())).await? {
+            return Ok(false);
         }
         let app = self.clone();
         tokio::spawn(async move { app.clean_partitions(scan).await });
-        let Some(spec) = self.db.call(move |c| db::scan_spec(c, scan)).await? else { return Ok(()) };
-        let ctx = spec.context;
-        let (leaks, gone) = self.db.call(move |c| db::finish_scan(c, scan, &ctx, now())).await?;
-        self.event("scan", format!("scan {scan} finished: {leaks} unheld references, {gone} findings gone")).await;
+        Ok(true)
+    }
+
+    /// Let a scan's joins go once the rest is in, and close the scan when
+    /// its last unit is: in one transaction ( db::finish_scan ), as
+    /// housekeeping and every report and failure do this at once.  A
+    /// cancelled scan does not close, but its units in flight when it was
+    /// cancelled may have written to the work pool since.
+    async fn maybe_finish(self: &Arc<Self>, scan: i64) -> Result<()> {
+        match self.db.call(move |c| db::scan_state(c, scan)).await?.as_deref() {
+            Some("running") => {}
+            Some("cancelled") => {
+                let app = self.clone();
+                tokio::spawn(async move { app.clean_partitions(scan).await });
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+        // not complete yet, or another report closed it since
+        let Some((leaks, gone)) = self.db.call(move |c| db::finish_scan(c, scan, now())).await? else { return Ok(()) };
+        let app = self.clone();
+        tokio::spawn(async move { app.clean_partitions(scan).await });
+        let errored = self.db.call(move |c| db::errored_units(c, scan)).await?;
+        let errored = if errored > 0 { format!(", {errored} units with errors") } else { String::new() };
+        self.event("scan", format!("scan {scan} finished: {leaks} unheld references, {gone} findings gone{errored}")).await;
         Ok(())
     }
 
@@ -451,30 +507,55 @@ async fn gc_snapshot(_: ClientAuth, State(app): State<Shared>, UrlPath(scan): Ur
             json.as_ref().clone(),
         )
             .into_response()),
-        // a server restarted mid-scan has no snapshot: an empty one
-        _ => Ok(Json(GcIndex::default()).into_response()),
+        // a server restarted mid-scan has no snapshot: an empty one, so the
+        // scan cannot tell queued_for_gc findings gone
+        _ => {
+            app.db.call(move |c| db::gc_missed(c, scan)).await?;
+            Ok(Json(GcIndex::default()).into_response())
+        }
     }
 }
 
-async fn report(_: ClientAuth, State(app): State<Shared>, Json(r): Json<Report>) -> ApiResult<StatusCode> {
-    let unit = r.unit;
+/// The scan a unit is of.
+async fn unit_scan(app: &App, unit: i64) -> ApiResult<i64> {
     let scan: Option<i64> = app
         .db
         .call(move |c| Ok(c.query_row("SELECT scan_id FROM units WHERE id = ?1", [unit], |row| row.get(0)).ok()))
         .await?;
-    let Some(scan) = scan else { return Err(ApiError(StatusCode::NOT_FOUND, format!("no unit {unit}"))) };
-    let (client, report) = (r.client.clone(), r.report);
-    let summary = format!("{}: {} RADOS objects, {} findings, {:.1} s, by {}", report.bucket, report.rados_objects, report.findings.len(), report.seconds, client);
-    app.db.call(move |c| db::complete(c, scan, unit, &client, &report, now())).await?;
+    scan.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no unit {unit}")))
+}
+
+async fn report(_: ClientAuth, State(app): State<Shared>, Json(r): Json<Report>) -> ApiResult<StatusCode> {
+    let unit = r.unit;
+    let scan = unit_scan(&app, unit).await?;
+    let (client, report, earlier) = (r.client.clone(), r.report, r.earlier_findings);
+    let summary = format!("{}: {} RADOS objects, {} findings, {:.1} s, by {}", report.bucket, report.rados_objects, report.findings.len() + earlier, report.seconds, client);
+    app.db.call(move |c| db::complete_after_parts(c, scan, unit, &client, &report, earlier, now())).await?;
     tracing::info!("{summary}");
     app.maybe_finish(scan).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A part of a report too big for one post; the report itself follows.
+async fn report_part(_: ClientAuth, State(app): State<Shared>, Json(r): Json<Report>) -> ApiResult<StatusCode> {
+    let unit = r.unit;
+    let scan = unit_scan(&app, unit).await?;
+    let client = r.client.clone();
+    if !app.db.call(move |c| db::report_part(c, scan, unit, &r.client, &r.report, now())).await? {
+        return Err(ApiError(StatusCode::CONFLICT, format!("unit {unit} is not leased to {client}")));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn failure(_: ClientAuth, State(app): State<Shared>, Json(f): Json<Failure>) -> ApiResult<StatusCode> {
     let msg = format!("unit {} failed on {}: {}", f.unit, f.client, f.error);
-    app.db.call(move |c| db::fail(c, f.unit, &f.client, &f.error)).await?;
+    let unit = f.unit;
+    app.db.call(move |c| db::fail(c, f.unit, &f.client, &f.error, now())).await?;
     app.event("unit", msg).await;
+    // what it wrote to a cancelled scan's work pool goes
+    if let Ok(scan) = unit_scan(&app, unit).await {
+        app.maybe_finish(scan).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -512,27 +593,104 @@ async fn api_status(_: AdminAuth, State(app): State<Shared>) -> ApiResult<Json<s
     Ok(Json(serde_json::json!({ "settings": settings, "scans": scans, "clients": clients })))
 }
 
-/// Findings from elsewhere: rgw-integrity scan, or rgw-gap-list.py, as JSON lines.
+/// Findings from elsewhere: rgw-integrity scan's JSON lines, or rgw-gap-list's
+/// results ( gaplist::read ), which become the unverified findings a scan of
+/// their buckets replaces or marks gone.  A tenant's line the oid does not
+/// settle is settled by the cluster's bucket names ( gaplist::settle_tenants ).
+/// A gap already recorded, open or gone, is left as it is
+/// ( db::insert_finding ).  Answers how many were taken.
 async fn api_import(AdminAuth(who): AdminAuth, State(app): State<Shared>, body: String) -> ApiResult<Json<usize>> {
-    let findings: Vec<Finding> = body
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(serde_json::from_str)
-        .collect::<Result<_, _>>()
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e}")))?;
-    let n = findings.len();
-    app.db
+    let mut import = gaplist::read(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let unsettled = gaplist::settle_tenants(&app.admin, &mut import.gaps).await;
+    let (findings, lines) = (import.findings, import.gaps.len());
+    let gaps = gaplist::findings(&import.gaps);
+    let (n, g) = (findings.len(), gaps.len());
+    let added = app
+        .db
         .call(move |c| {
             let tx = c.transaction()?;
             for f in &findings {
                 db::upsert_finding(&tx, None, f, now())?;
             }
+            // what a scan already recorded stands
+            let mut added = 0;
+            for f in &gaps {
+                added += db::insert_finding(&tx, f, now())? as usize;
+            }
             tx.commit()?;
-            Ok(())
+            Ok(added)
         })
         .await?;
-    app.event("import", format!("{n} findings imported by {}", who.name)).await;
-    Ok(Json(n))
+    let mut msg = if lines > 0 {
+        format!("{} findings imported by {}, {added} of them from {lines} rgw-gap-list lines ( {} known already )", n + added, who.name, g - added)
+    } else {
+        format!("{n} findings imported by {}", who.name)
+    };
+    if let Some(w) = unsettled {
+        msg.push_str(&format!("; {w}"));
+    }
+    app.event("import", msg).await;
+    Ok(Json(n + added))
+}
+
+/// 404 unless there is a scan `id`.
+async fn known_scan(app: &App, id: i64) -> ApiResult<()> {
+    match app.db.call(move |c| db::scan_spec(c, id)).await? {
+        Some(_) => Ok(()),
+        None => Err(ApiError(StatusCode::NOT_FOUND, format!("no scan {id}"))),
+    }
+}
+
+#[derive(Deserialize)]
+struct UnitsQuery {
+    state: Option<String>,
+}
+
+/// A scan's units, as rgw-gap-list -r -j gives its buckets: each one's
+/// state, times, RADOS objects, gaps, findings and what it skipped.
+async fn api_units(_: AdminAuth, State(app): State<Shared>, UrlPath(id): UrlPath<i64>, Query(q): Query<UnitsQuery>) -> ApiResult<Json<Vec<db::UnitRow>>> {
+    known_scan(&app, id).await?;
+    let state = q.state.filter(|s| !s.is_empty());
+    Ok(Json(app.db.call(move |c| db::units(c, id, state.as_deref(), i64::MAX as usize)).await?))
+}
+
+/// Lines of a gap list read at once.
+const GAP_PAGE: usize = 10_000;
+
+/// A scan's gap list, a page at a time: text, a line per missing RADOS
+/// object.
+fn gap_list(db: Db, scan: i64, page: usize) -> impl futures::Stream<Item = Result<String>> {
+    // None: the list is done
+    futures::stream::unfold(Some(None::<(i64, String)>), move |after| {
+        let db = db.clone();
+        async move {
+            let after = after?;
+            let rows = match db.call(move |c| db::gap_lines(c, scan, after.as_ref(), page)).await {
+                Ok(rows) => rows,
+                Err(e) => return Some((Err(e), None)),
+            };
+            let last = rows.last().cloned()?;
+            let text: String = rows.into_iter().map(|(_, line)| line + "\n").collect();
+            Some((Ok(text), Some(Some(last))))
+        }
+    })
+}
+
+/// A scan's gap list, as rgw-gap-list writes it: `s3://bucket/key MISSING
+/// <oid>` lines ( a tenant's bucket as tenant/bucket ), which rgw-gap-list
+/// -x and rgw-integrity verify and import take.  rgw-gap-verify-versioned.sh
+/// reads them too, but checks none: see verify.rs.
+async fn api_missing(_: AdminAuth, State(app): State<Shared>, UrlPath(id): UrlPath<i64>) -> ApiResult<Response> {
+    known_scan(&app, id).await?;
+    let body = axum::body::Body::from_stream(gap_list(app.db.clone(), id, GAP_PAGE));
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"rgw-integrity-missing-scan-{id}.txt\"")),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 pub fn router(app: Shared) -> Router {
@@ -543,13 +701,17 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/scan/{id}/buckets", get(scan_buckets))
         .route("/api/v1/gc/{scan}", get(gc_snapshot))
         .route("/api/v1/report", post(report))
+        .route("/api/v1/report/part", post(report_part))
         .route("/api/v1/fail", post(failure))
         .route("/api/v1/scans", post(api_start))
+        .route("/api/v1/scans/{id}/units", get(api_units))
+        .route("/api/v1/scans/{id}/missing", get(api_missing))
         .route("/api/v1/findings", get(api_findings))
         .route("/api/v1/settings", post(api_settings))
         .route("/api/v1/status", get(api_status))
         .route("/api/v1/import", post(api_import))
         .merge(web::routes())
+        // clients send a big report in parts of proto::REPORT_PART_BYTES
         .layer(axum::extract::DefaultBodyLimit::max(512 << 20))
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(app)
@@ -638,4 +800,155 @@ pub async fn serve(opts: ServeOpts, admin: Arc<Admin>, store: Option<Arc<dyn Sto
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::finding::Catalog;
+    use crate::scan::{BucketReport, Options};
+    use futures::StreamExt;
+
+    fn req(prefix: Option<&str>, orphans: bool, buckets: &[&str]) -> StartScan {
+        StartScan {
+            options: Options { match_prefix: prefix.map(str::to_string), orphans, ..Options::default() },
+            buckets: buckets.iter().map(|b| b.to_string()).collect(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn scan_requests_are_normalised() {
+        // a blank prefix is every key, so orphans may be found, and the scan stores none
+        for p in ["", "  "] {
+            let mut r = req(Some(p), true, &[]);
+            assert!(check_start(&mut r).is_ok(), "{p:?}");
+            assert_eq!(r.options.match_prefix, None);
+        }
+        let mut r = req(Some(" logs/ "), false, &[]);
+        check_start(&mut r).unwrap();
+        assert_eq!(r.options.match_prefix.as_deref(), Some("logs/"));
+        assert!(check_start(&mut req(Some(" logs/ "), true, &[])).is_err());
+        assert!(check_start(&mut req(None, true, &["b"])).is_err());
+        assert!(check_start(&mut req(None, false, &[""])).is_err());
+    }
+
+
+    #[tokio::test]
+    async fn the_gap_list_streams_in_pages() {
+        let path = std::env::temp_dir().join(format!("rgwi-{}-{}.db", std::process::id(), rand::random::<u32>()));
+        let db = Db::open(&format!("file:{}", path.display()), "").unwrap();
+        let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
+        let units = vec![db::NewUnit::bucket("a".into(), 2, None), db::NewUnit::bucket("b".into(), 1, None)];
+        let scan = db.call(move |c| db::insert_scan(c, 1, &Options::default(), &ctx, 7200, 0, "", None, &units)).await.unwrap();
+        let mut want = Vec::new();
+        for u in db.call(|c| db::lease(c, "c", 2, 1, 60)).await.unwrap() {
+            let missing: Vec<String> = (0..5).map(|i| format!("s3://{}/k{i} MISSING m_k{i}", u.bucket)).collect();
+            want.extend(missing.clone());
+            let r = BucketReport { gaps: 5, missing, ..Default::default() };
+            db.call(move |c| db::complete(c, scan, u.id, "c", &r, 2)).await.unwrap();
+        }
+        want.sort();
+        // pages of 3 lines, across units
+        let chunks: Vec<String> = gap_list(db.clone(), scan, 3).map(|c| c.unwrap()).collect().await;
+        assert_eq!(chunks.len(), 4);
+        let mut got: Vec<String> = chunks.concat().lines().map(str::to_string).collect();
+        got.sort();
+        assert_eq!(got, want);
+        // a scan without gaps: nothing
+        assert_eq!(gap_list(db, scan + 1, 3).count().await, 0);
+    }
+
+    fn app(work: &str) -> Shared {
+        let path = std::env::temp_dir().join(format!("rgwi-{}-{}.db", std::process::id(), rand::random::<u32>()));
+        Arc::new(App {
+            db: Db::open(&format!("file:{}", path.display()), "").unwrap(),
+            admin: Arc::new(Admin::new("false".into(), None, None, crate::admin::DEFAULT_CONCURRENCY)),
+            store: Some(Arc::new(crate::store::MockStore::new(1, 0))),
+            catalog: Catalog::builtin(),
+            client_token: String::new(),
+            admin_token: String::new(),
+            gc: RwLock::new(None),
+            starting: tokio::sync::Mutex::new(()),
+            secure_cookies: false,
+            work_pool: Some(work.into()),
+            partitions: None,
+            slices: None,
+            shard_units_above: 0,
+            oidc: None,
+            oidc_only: false,
+            public_url: None,
+            sessions: std::sync::Mutex::default(),
+        })
+    }
+
+    /// Orphan detection lists the pools the scan stats in ( --pool's, as the
+    /// store has them ), not only the zone's data pools; and with none, it is
+    /// refused rather than finding no orphans.
+    #[tokio::test]
+    async fn orphans_list_the_stat_pools() {
+        let with = |specs: &[&str]| {
+            let mut store = crate::store::MockStore::new(2, 0);
+            store.specs = specs.iter().map(|s| s.to_string()).collect();
+            store.listing.insert("hot".into(), vec!["o".into(); 3]);
+            let mut app = app("work");
+            Arc::get_mut(&mut app).expect("unshared").store = Some(Arc::new(store));
+            app
+        };
+        let mut units = Vec::new();
+        let plan = with(&["hot", r"cold\:x:ns"]).plan_orphans(&mut units).await.unwrap();
+        let listed: Vec<(String, u64)> = units
+            .iter()
+            .filter(|u| u.kind == "list")
+            .map(|u| (serde_json::from_str::<crate::detect::Slice>(u.spec.as_deref().unwrap()).unwrap().pool, u.objects))
+            .collect();
+        assert_eq!(listed, [("hot".to_string(), 3), (r"cold\:x:ns".to_string(), 0)]);
+        assert_eq!(units.iter().filter(|u| u.kind == "join").count(), plan.partitions as usize);
+        let e = format!("{:#}", with(&[]).plan_orphans(&mut Vec::new()).await.unwrap_err());
+        assert!(e.contains("needs the data pools"), "{e}");
+    }
+
+    /// Wait for the work pool to hold none of these.
+    async fn cleaned(shuffle: &dyn crate::shuffle::Shuffle, names: &[String]) -> bool {
+        for _ in 0..500 {
+            let mut left = false;
+            for n in names {
+                left |= shuffle.read(n).await.unwrap().is_some();
+            }
+            if !left {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn cancelling_cleans_the_work_pool() {
+        let work = format!("work{}", rand::random::<u32>());
+        let app = app(&work);
+        let plan = crate::detect::Plan { partitions: 2, work: Some(work.clone()), created: 1 };
+        let ctx = Context { catalog: app.catalog.clone(), ..Default::default() };
+        let units = vec![db::NewUnit::bucket("a".into(), 2, None), db::NewUnit::bucket("b".into(), 1, None)];
+        let opts = crate::scan::Options { orphans: true, ..Default::default() };
+        let scan = app.db.call(move |c| db::insert_scan(c, 1, &opts, &ctx, 7200, 0, "", Some(&plan), &units)).await.unwrap();
+        let leased = app.db.call(|c| db::lease(c, "c:1", 2, 1, 60)).await.unwrap();
+        let shuffle = app.store.as_ref().unwrap().shuffle(&work).unwrap();
+        let names: Vec<String> = (0..2).flat_map(|p| [crate::detect::ref_name(scan, p, "c:1"), crate::detect::list_name(scan, p, "c:1")]).collect();
+        for n in &names {
+            shuffle.append(n, vec![1]).await.unwrap();
+        }
+        assert!(app.cancel_scan(scan).await.unwrap());
+        assert!(cleaned(shuffle.as_ref(), &names).await, "the cancel removes the partitions");
+        // a unit in flight writes on, then reports: that goes too, and the
+        // scan stays cancelled
+        shuffle.append(&names[0], vec![2]).await.unwrap();
+        let unit = leased[0].id;
+        app.db.call(move |c| db::complete_after_parts(c, scan, unit, "c:1", &BucketReport::default(), 0, 2)).await.unwrap();
+        app.maybe_finish(scan).await.unwrap();
+        assert!(cleaned(shuffle.as_ref(), &names).await, "a late report removes what it wrote");
+        assert_eq!(app.db.call(move |c| db::scan_state(c, scan)).await.unwrap().as_deref(), Some("cancelled"));
+        assert!(!app.cancel_scan(scan).await.unwrap(), "not running");
+        std::fs::remove_dir_all(std::env::temp_dir().join(format!("rgwi-mock-{}-{work}", std::process::id()))).ok();
+    }
 }

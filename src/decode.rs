@@ -1,8 +1,9 @@
 //! Ceph's encodings of what the native listing reads: bucket index entries,
-//! and object manifests, and the manifest's walk over an object's stripes.
-//! Ports of cls_rgw_types.h, rgw_obj_types.h, rgw_bucket_types.h and
-//! rgw_obj_manifest.{h,cc}, legacy versions included, since clusters
-//! upgraded from old releases still hold objects they wrote.
+//! object manifests and the manifest's walk over an object's stripes, and
+//! Swift large objects' manifests.  Ports of cls_rgw_types.h,
+//! rgw_obj_types.h, rgw_bucket_types.h, rgw_obj_manifest.{h,cc} and
+//! rgw_op.h's RGWSLOInfo, legacy versions included, since clusters upgraded
+//! from old releases still hold objects they wrote.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -304,9 +305,15 @@ pub type BiPage = (Vec<(u8, Vec<u8>, Vec<u8>)>, bool);
 
 /// rgw_cls_bi_list_op, version 1: every release takes it.
 pub fn bi_list_op(marker: &[u8], max: u32) -> Vec<u8> {
+    bi_list_named_op("", marker, max)
+}
+
+/// The same, of one index name only: its plain, instance and OLH entries.
+pub fn bi_list_named_op(name_filter: &str, marker: &[u8], max: u32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend(max.to_le_bytes());
-    body.extend(0u32.to_le_bytes()); // name_filter
+    body.extend((name_filter.len() as u32).to_le_bytes());
+    body.extend(name_filter.as_bytes());
     body.extend((marker.len() as u32).to_le_bytes());
     body.extend(marker);
     let mut out = vec![1u8, 1];
@@ -696,6 +703,94 @@ pub fn object_names(head: &RawName, manifest: Option<&Manifest>) -> Result<BTree
     Ok(names)
 }
 
+// ---- Swift large objects
+
+/// rgw_slo_entry: a segment of a static large object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SloEntry {
+    /// "/container/object"
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+}
+
+/// RGWSLOInfo: the user.rgw.slo_manifest xattr of an SLO's head.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SloInfo {
+    pub entries: Vec<SloEntry>,
+    pub total_size: u64,
+}
+
+impl SloInfo {
+    /// RGWSLOInfo::decode, DECODE_START(1): its entries, each an
+    /// rgw_slo_entry of DECODE_START(1), then its total size.
+    pub fn decode(buf: &[u8]) -> Result<SloInfo> {
+        let c = &mut Cursor::new(buf);
+        let h = c.start()?;
+        let n = c.u32()?;
+        let mut entries = Vec::new();
+        for _ in 0..n {
+            let eh = c.start()?;
+            let (path, etag, size_bytes) = (c.string()?, c.string()?, c.u64()?);
+            c.finish(eh)?;
+            entries.push(SloEntry { path, etag, size_bytes });
+        }
+        let total_size = c.u64()?;
+        c.finish(h)?;
+        Ok(SloInfo { entries, total_size })
+    }
+}
+
+/// rgw's url_decode(), outside a query: %XX is the byte XX, and after a '?'
+/// a '+' is a space.  A '%' with fewer than two characters after it ends the
+/// text; one followed by a character that is not a hex digit empties it.
+pub fn url_decode(s: &[u8]) -> String {
+    let hex = |c: u8| (c as char).to_digit(16);
+    let (mut out, mut in_query, mut i) = (Vec::with_capacity(s.len()), false, 0);
+    while i < s.len() {
+        match s[i] {
+            b'%' if s.len() - i < 3 => break,
+            b'%' => match (hex(s[i + 1]), hex(s[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push((h << 4 | l) as u8);
+                    i += 2;
+                }
+                _ => return String::new(),
+            },
+            b'+' if in_query => out.push(b' '),
+            c => {
+                in_query |= c == b'?';
+                out.push(c);
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The container and object an SLO segment's path names, as a GET of the
+/// SLO reads them ( RGWGetObj::handle_slo_manifest ): every leading '/'
+/// stripped, then up to the next '/', and the rest, neither decoded.  None
+/// without that '/', or with no object after it.  ( radoslist skips one
+/// character and url-decodes both; the two agree on "/container/object"
+/// paths with nothing to decode. )
+pub fn slo_segment(path: &str) -> Option<(String, String)> {
+    let (container, object) = path.trim_start_matches('/').split_once('/')?;
+    (!container.is_empty() && !object.is_empty()).then(|| (container.to_string(), object.to_string()))
+}
+
+/// The container and prefix of a DLO's user.rgw.user_manifest, a NUL-ended
+/// "container/prefix", as a GET of the DLO reads them
+/// ( RGWGetObj::handle_user_manifest ): split at the first '/', each
+/// url-decoded ( radoslist decodes neither ).  None without a '/', or with
+/// no container.
+pub fn dlo_segments(attr: &[u8]) -> Option<(String, String)> {
+    let text = attr.split(|&c| c == 0).next().unwrap_or_default();
+    let sep = text.iter().position(|&c| c == b'/')?;
+    let container = url_decode(&text[..sep]);
+    (!container.is_empty()).then(|| (container, url_decode(&text[sep + 1..])))
+}
+
 #[cfg(test)]
 pub mod enc {
     //! Encoders for tests, mirroring Ceph's.
@@ -742,6 +837,45 @@ pub mod enc {
         }
     }
 
+    /// rgw_bucket_dir_entry, version 8
+    pub fn dir_entry(d: &DirEntry) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.st(8, 3, |e| {
+            e.s(&d.name).u64(0).u8(d.exists as u8);
+            e.st(7, 3, |e| {
+                e.u8(0).u64(d.size).u32(d.mtime as u32).u32(0).s(&d.etag).s("").s("").s("").u64(d.size).s("").s("").u8(0);
+            });
+            e.u32(d.pending as u32);
+            for i in 0..d.pending {
+                e.s(&format!("op{i}")).st(2, 2, |e| {
+                    e.u8(0).u32(0).u32(0).u8(1);
+                });
+            }
+            e.s("").st(1, 1, |e| {
+                e.u8(0).u8(0);
+            });
+            e.u8(0).s(&d.tag).s(&d.instance).u16(d.flags).u64(0);
+        });
+        e.0
+    }
+
+    /// rgw_cls_bi_list_ret, of plain entries
+    pub fn bi_page<'a>(entries: impl IntoIterator<Item = &'a DirEntry>, truncated: bool) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.st(1, 1, |e| {
+            let entries: Vec<&DirEntry> = entries.into_iter().collect();
+            e.u32(entries.len() as u32);
+            for d in entries {
+                e.st(1, 1, |e| {
+                    let data = dir_entry(d);
+                    e.u8(1).s(&d.name).u32(data.len() as u32).raw(&data);
+                });
+            }
+            e.u8(truncated as u8);
+        });
+        e.0
+    }
+
     pub fn bucket(e: &mut Enc, b: &Bucket) {
         e.st(10, 10, |e| {
             e.s(&b.name).s(&b.marker).s(&b.bucket_id).s(&b.tenant).u8(0);
@@ -753,6 +887,35 @@ pub mod enc {
             bucket(e, &o.bucket);
             e.s(&o.key.ns).s(&o.key.name).s(&o.key.instance);
         });
+    }
+
+    /// an rgw_bucket_dir_entry of version 8, as bi_list returns it, from its
+    /// name, instance and flags
+    pub fn dir_entry_of(name: &str, instance: &str, flags: u16) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.st(8, 3, |e| {
+            e.s(name).u64(1).u8((flags & (FLAG_DELETE_MARKER | FLAG_VER_MARKER) == 0) as u8);
+            e.st(7, 3, |e| {
+                e.u8(1).u64(0).u32(1_700_000_000).u32(0).s("").s("owner").s("Owner").s("").u64(0).s("").s("").u8(0);
+            });
+            e.u32(0).s("").st(1, 1, |e| {
+                e.u8(0x81).u8(1).u8(0);
+            });
+            e.u8(0x82).u16(1).s("TAG").s(instance).u16(flags).u64(0);
+        });
+        e.0
+    }
+
+    /// The manifest of a completed upload's object `name`, or of a copy of
+    /// it: `parts` 1 MiB parts, of the upload whose tail prefix is
+    /// "<key>.<upload>", in bucket `marker`.
+    pub fn multipart_manifest(marker: &str, name: &str, prefix: &str, parts: u32) -> Vec<u8> {
+        let bucket = Bucket { tenant: String::new(), name: "b".into(), marker: marker.into(), bucket_id: marker.into() };
+        let key = Key { name: name.into(), instance: String::new(), ns: String::new() };
+        let mut m = Manifest { obj_size: u64::from(parts) << 20, obj: Obj { bucket: bucket.clone(), key }, prefix: prefix.into(), ..Default::default() };
+        m.rules.insert(0, Rule { start_part_num: 1, start_ofs: 0, part_size: 1 << 20, stripe_max_size: 4 << 20, ..Default::default() });
+        m.tail_bucket = bucket;
+        manifest(&m)
     }
 
     pub fn manifest(m: &Manifest) -> Vec<u8> {
@@ -780,6 +943,21 @@ pub mod enc {
             e.st(2, 2, |e| {
                 e.s("none");
             });
+        });
+        e.0
+    }
+
+    /// RGWSLOInfo of segments at these paths, as RGWSLOInfo::encode writes it
+    pub fn slo_info(paths: &[&str]) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.st(1, 1, |e| {
+            e.u32(paths.len() as u32);
+            for p in paths {
+                e.st(1, 1, |e| {
+                    e.s(p).s("etag").u64(1);
+                });
+            }
+            e.u64(paths.len() as u64);
         });
         e.0
     }
@@ -888,6 +1066,17 @@ mod tests {
     }
 
     #[test]
+    fn bi_list_of_a_name() {
+        assert_eq!(bi_list_named_op("ab", b"m", 5), [1, 1, 15, 0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, b'a', b'b', 1, 0, 0, 0, b'm']);
+        assert_eq!(bi_list_op(b"", 5), [1, 1, 12, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let d = DirEntry { name: "obj".into(), instance: "v1".into(), exists: true, size: 3, mtime: 1_700_000_000, etag: "E".into(), pending: 2, tag: "T".into(), flags: 1 };
+        let (page, truncated) = bi_list_ret(&bi_page([&d], true)).unwrap();
+        assert!(truncated);
+        assert_eq!((page.len(), page[0].0, page[0].1.as_slice()), (1, 1, b"obj".as_slice()));
+        assert_eq!(DirEntry::decode(&page[0].2).unwrap(), d);
+    }
+
+    #[test]
     fn dir_entry() {
         let mut e = Enc::new();
         e.st(8, 3, |e| {
@@ -908,5 +1097,61 @@ mod tests {
         assert_eq!((d.pending, d.tag.as_str(), d.instance.as_str(), d.is_delete_marker()), (1, "TAG", "inst", true));
         assert_eq!(d.display(), "obj[inst]");
         assert!(DirEntry::decode(&e.0[..20]).is_err());
+    }
+
+    #[test]
+    fn slo_info() {
+        // RGWSLOInfo by hand: ENCODE_START(1, 1), two rgw_slo_entry of
+        // ENCODE_START(1, 1) { path, etag, size_bytes }, then total_size
+        let mut buf = vec![1, 1, 74, 0, 0, 0, 2, 0, 0, 0];
+        for (path, size) in [("/segs/s1", 5u64), ("/segs/s2", 7)] {
+            buf.extend([1, 1, 25, 0, 0, 0, 8, 0, 0, 0]);
+            buf.extend(path.as_bytes());
+            buf.extend([1, 0, 0, 0, b'e']);
+            buf.extend(size.to_le_bytes());
+        }
+        buf.extend(12u64.to_le_bytes());
+        let info = SloInfo::decode(&buf).unwrap();
+        let entry = |path: &str, size_bytes| SloEntry { path: path.into(), etag: "e".into(), size_bytes };
+        assert_eq!(info, SloInfo { entries: vec![entry("/segs/s1", 5), entry("/segs/s2", 7)], total_size: 12 });
+        assert!(SloInfo::decode(&buf[..buf.len() - 1]).is_err());
+        // a later version's extra fields are skipped
+        let mut v2 = buf.clone();
+        v2[0] = 2;
+        v2[2] += 1;
+        v2.push(9);
+        assert_eq!(SloInfo::decode(&v2).unwrap().total_size, 12);
+        assert_eq!(SloInfo::decode(&super::enc::slo_info(&["/c/o"])).unwrap().entries[0].path, "/c/o");
+    }
+
+    #[test]
+    fn large_object_paths() {
+        assert_eq!(url_decode(b"a%20b%2Fc"), "a b/c");
+        assert_eq!(url_decode(b"a+b?c+d"), "a+b?c d");
+        // a truncated escape ends the text; a bad one empties it
+        assert_eq!(url_decode(b"ab%2"), "ab");
+        assert_eq!(url_decode(b"ab%zz"), "");
+        let own = |c: &str, o: &str| Some((c.to_string(), o.to_string()));
+        assert_eq!(slo_segment("/segs/s1"), own("segs", "s1"));
+        // as a GET reads them: no leading '/', or several, and nothing decoded
+        assert_eq!(slo_segment("segs/s1"), own("segs", "s1"));
+        assert_eq!(slo_segment("//segs/dir/s%201"), own("segs", "dir/s%201"));
+        assert_eq!(slo_segment("/segs/"), None);
+        assert_eq!(slo_segment("/segs"), None);
+        assert_eq!(slo_segment("///"), None);
+        assert_eq!(slo_segment(""), None);
+        assert_eq!(dlo_segments(b"segs/p/\0"), own("segs", "p/"));
+        assert_eq!(dlo_segments(b"my%20segs/a%2Bb"), own("my segs", "a+b"));
+        assert_eq!(dlo_segments(b"segs/\0junk"), own("segs", ""));
+        assert_eq!(dlo_segments(b"segs\0/p"), None);
+        assert_eq!(dlo_segments(b"/p"), None);
+    }
+
+    #[test]
+    fn null_delete_marker_entry() {
+        // a delete marker made under suspended versioning has no instance,
+        // and names its key's OLH
+        let d = DirEntry::decode(&super::enc::dir_entry_of("k", "", 0x1 | 0x2 | FLAG_DELETE_MARKER)).unwrap();
+        assert_eq!((d.instance.as_str(), d.exists, d.is_delete_marker(), d.display(), d.key().oid()), ("", false, true, "k".to_string(), "k".to_string()));
     }
 }

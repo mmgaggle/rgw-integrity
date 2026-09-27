@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 
 use crate::admin::Admin;
 use crate::limiter::Limiter;
-use crate::proto::{Control, Failure, Heartbeat, LeaseRequest, Leased, Report, ScanSpec, Unit, UnitProgress};
+use crate::proto::{Control, Failure, Heartbeat, LeaseRequest, Leased, REPORT_PART_BYTES, ScanSpec, Unit, UnitProgress};
 use crate::scan::{BucketReport, Engine, GcIndex};
 use crate::store::Store;
 
@@ -75,7 +75,8 @@ impl Http {
 struct State {
     id: String,
     host: String,
-    progress: Mutex<HashMap<i64, (String, Arc<AtomicU64>)>>,
+    /// the running units: bucket, RADOS objects listed and gaps found so far
+    progress: Mutex<HashMap<i64, (String, Arc<AtomicU64>, Arc<AtomicU64>)>>,
     checked: AtomicU64,
     errors: AtomicU64,
     draining: AtomicBool,
@@ -88,7 +89,12 @@ impl State {
             .lock()
             .unwrap()
             .iter()
-            .map(|(unit, (bucket, n))| UnitProgress { unit: *unit, bucket: bucket.clone(), rados_objects: n.load(Ordering::Relaxed) })
+            .map(|(unit, (bucket, n, gaps))| UnitProgress {
+                unit: *unit,
+                bucket: bucket.clone(),
+                rados_objects: n.load(Ordering::Relaxed),
+                gaps: gaps.load(Ordering::Relaxed),
+            })
             .collect();
         Heartbeat {
             client: self.id.clone(),
@@ -166,6 +172,7 @@ async fn scan_engine(http: &Http, store: &Arc<dyn Store>, admin: &Arc<Admin>, li
         Some(pool) => Some(store.shuffle(pool)?),
         None => None,
     };
+    let named = spec.options.listing == crate::scan::Listing::Native && !spec.options.every_bucket && !spec.options.orphans;
     let engine = Engine {
         store: store.clone(),
         admin: admin.clone(),
@@ -175,12 +182,22 @@ async fn scan_engine(http: &Http, store: &Arc<dyn Store>, admin: &Arc<Admin>, li
         limiter: limiter.clone(),
         opts: spec.options,
         partitions: plan.as_ref().map(|p| p.partitions),
+        segments: Default::default(),
     };
+    // a scan of named buckets: they check the Swift segments they hold themselves
+    if named {
+        match http.get::<Vec<crate::admin::BucketStats>>(&format!("/api/v1/scan/{scan}/buckets")).await {
+            Ok(stats) => engine.segments.lists_too(stats.iter().map(crate::admin::BucketStats::name)),
+            Err(e) => tracing::warn!("scan {scan}: its buckets ( {e:#} ): following Swift large objects' segments into every other"),
+        }
+    }
+    engine.note_listing();
     Ok(ScanEngine { scan, engine: Arc::new(engine), gc_version, plan, shuffle, markers: Default::default() })
 }
 
 /// Run one unit: scan a bucket, list a pool slice, or join a partition.
-async fn run_unit(se: Arc<ScanEngine>, http: Arc<Http>, writer: String, unit: &Unit, progress: Arc<AtomicU64>) -> Result<BucketReport> {
+/// `progress` and `gaps` count as it goes.
+async fn run_unit(se: Arc<ScanEngine>, http: Arc<Http>, writer: String, unit: &Unit, progress: Arc<AtomicU64>, gaps: Arc<AtomicU64>) -> Result<BucketReport> {
     let started = std::time::Instant::now();
     match unit.kind.as_str() {
         "list" => {
@@ -228,7 +245,7 @@ async fn run_unit(se: Arc<ScanEngine>, http: Arc<Http>, writer: String, unit: &U
                 }
                 _ => (unit.bucket.clone(), None),
             };
-            let mut r = se.engine.scan_bucket_with(&bucket, unit.stats.clone(), progress, shard).await?;
+            let mut r = se.engine.scan_bucket_counting(&bucket, unit.stats.clone(), progress, gaps, shard).await?;
             // the references must be in the partitions before the report says the bucket is done
             if let Some(refs) = r.references.take() {
                 let (_, shuffle) = se.detection()?;
@@ -237,6 +254,16 @@ async fn run_unit(se: Arc<ScanEngine>, http: Arc<Http>, writer: String, unit: &U
             Ok(r)
         }
     }
+}
+
+/// Post a unit's report, in parts first when it is too big for one post.
+async fn deliver(http: &Http, client: &str, unit: i64, report: BucketReport) -> Result<()> {
+    let (parts, report) = crate::proto::split_report(client, unit, report, REPORT_PART_BYTES);
+    let n = parts.len() + 1;
+    for (i, part) in parts.iter().enumerate() {
+        http.post::<_, ()>("/api/v1/report/part", part).await.with_context(|| format!("part {} of {n}", i + 1))?;
+    }
+    http.post::<_, ()>("/api/v1/report", &report).await
 }
 
 pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> Result<()> {
@@ -313,12 +340,12 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
                                 }
                             }
                             let se = engines[&unit.scan].clone();
-                            let progress = Arc::new(AtomicU64::new(0));
-                            state.progress.lock().unwrap().insert(unit.id, (unit.bucket.clone(), progress.clone()));
+                            let (progress, gaps) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                            state.progress.lock().unwrap().insert(unit.id, (unit.bucket.clone(), progress.clone(), gaps.clone()));
                             tracing::info!("{} ( unit {}, {} )", unit.bucket, unit.id, unit.kind);
                             let (http, writer) = (http.clone(), state.id.clone());
                             running.spawn(async move {
-                                let r = run_unit(se, http, writer, &unit, progress).await;
+                                let r = run_unit(se, http, writer, &unit, progress, gaps).await;
                                 (unit, r)
                             });
                         }
@@ -339,16 +366,28 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
         tokio::select! {
             Some(done) = running.join_next(), if !running.is_empty() => {
                 let (unit, result) = done?;
-                state.progress.lock().unwrap().remove(&unit.id);
                 match result {
-                    Ok(mut report) => {
+                    Ok(report) => {
                         state.checked.fetch_add(report.rados_objects, Ordering::Relaxed);
                         state.errors.fetch_add(report.errors.len() as u64, Ordering::Relaxed);
-                        report.missing = Vec::new();
-                        tracing::info!("{}: {} RADOS objects, {} findings in {:.1} s", report.bucket, report.rados_objects, report.findings.len(), report.seconds);
-                        let r = Report { client: state.id.clone(), unit: unit.id, report };
-                        match http.post::<_, ()>("/api/v1/report", &r).await {
-                            Err(e) => tracing::error!("reporting {}: {e:#}", unit.bucket),
+                        // the MISSING lines go too: the server keeps the scan's gap list
+                        tracing::info!(
+                            "{}: {} RADOS objects, {} missing, {} findings in {:.1} s",
+                            report.bucket,
+                            report.rados_objects,
+                            report.gaps,
+                            report.findings.len(),
+                            report.seconds
+                        );
+                        match deliver(&http, &state.id, unit.id, report).await {
+                            // fail the unit, rather than let its lease lapse
+                            Err(e) => {
+                                tracing::error!("reporting {}: {e:#}", unit.bucket);
+                                let f = Failure { client: state.id.clone(), unit: unit.id, error: format!("delivering the report: {e:#}") };
+                                if let Err(e) = http.post::<_, ()>("/api/v1/fail", &f).await {
+                                    tracing::error!("reporting the failure of {}: {e:#}", unit.bucket);
+                                }
+                            }
                             // a joined partition's objects go once the server has its findings
                             Ok(()) if unit.kind == "join" => {
                                 if let (Some(se), Some(spec)) = (engines.get(&unit.scan), unit.spec.clone()) {
@@ -371,9 +410,34 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
                         }
                     }
                 }
+                // heartbeats renew the unit's lease until it is reported
+                state.progress.lock().unwrap().remove(&unit.id);
             }
             _ = control.changed() => {}
             _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeats_carry_the_gaps_so_far() {
+        let state = State {
+            id: "c:1".into(),
+            host: "c".into(),
+            progress: Mutex::default(),
+            checked: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            draining: AtomicBool::new(false),
+        };
+        let (objects, gaps) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        state.progress.lock().unwrap().insert(7, ("b".into(), objects.clone(), gaps.clone()));
+        objects.store(100, Ordering::Relaxed);
+        gaps.store(3, Ordering::Relaxed);
+        let hb = state.heartbeat(&Limiter::new(4), 4);
+        assert_eq!((hb.units[0].unit, hb.units[0].rados_objects, hb.units[0].gaps), (7, 100, 3));
     }
 }

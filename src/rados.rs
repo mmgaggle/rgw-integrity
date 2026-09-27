@@ -13,13 +13,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
-use crate::store::{PoolId, Pools, Stat, Store};
+use crate::store::{PoolId, Pools, Stat, Store, distinct_pools, parse_pool, pool_spec};
 
 type rados_t = *mut c_void;
 type rados_ioctx_t = *mut c_void;
 type rados_completion_t = *mut c_void;
 type rados_read_op_t = *mut c_void;
 type rados_omap_iter_t = *mut c_void;
+type rados_xattrs_iter_t = *mut c_void;
 type rados_callback_t = Option<unsafe extern "C" fn(rados_completion_t, *mut c_void)>;
 type rados_object_list_cursor = *mut c_void;
 
@@ -50,6 +51,10 @@ unsafe extern "C" {
     fn rados_aio_get_return_value(c: rados_completion_t) -> c_int;
     fn rados_aio_stat(io: rados_ioctx_t, oid: *const c_char, c: rados_completion_t, psize: *mut u64, pmtime: *mut libc::time_t) -> c_int;
     fn rados_aio_getxattr(io: rados_ioctx_t, oid: *const c_char, c: rados_completion_t, name: *const c_char, buf: *mut c_char, len: usize) -> c_int;
+    fn rados_aio_getxattrs(io: rados_ioctx_t, oid: *const c_char, c: rados_completion_t, iter: *mut rados_xattrs_iter_t) -> c_int;
+    fn rados_getxattrs(io: rados_ioctx_t, oid: *const c_char, iter: *mut rados_xattrs_iter_t) -> c_int;
+    fn rados_getxattrs_next(iter: rados_xattrs_iter_t, name: *mut *const c_char, val: *mut *const c_char, len: *mut usize) -> c_int;
+    fn rados_getxattrs_end(iter: rados_xattrs_iter_t);
     fn rados_create_read_op() -> rados_read_op_t;
     fn rados_release_read_op(op: rados_read_op_t);
     fn rados_read_op_omap_get_vals2(
@@ -133,6 +138,28 @@ fn cstr(s: &str) -> Result<CString> {
     CString::new(s).map_err(|_| anyhow!("{s:?} holds a NUL"))
 }
 
+/// The xattrs a getxattrs iterator yields; it is ended.
+///
+/// # Safety
+/// `iter` is an iterator librados made, not yet ended.
+unsafe fn xattrs_of(iter: rados_xattrs_iter_t) -> Result<HashMap<String, Vec<u8>>> {
+    let mut xattrs = HashMap::new();
+    let r = loop {
+        let (mut name, mut val, mut len) = (std::ptr::null(), std::ptr::null(), 0usize);
+        let r = unsafe { rados_getxattrs_next(iter, &mut name, &mut val, &mut len) };
+        if r < 0 || name.is_null() {
+            break r;
+        }
+        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+        // an empty value comes as a null pointer
+        let val = if val.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(val as *const u8, len) }.to_vec() };
+        xattrs.insert(name, val);
+    };
+    unsafe { rados_getxattrs_end(iter) };
+    check(r, || "reading the xattrs".into())?;
+    Ok(xattrs)
+}
+
 pub struct Cluster {
     handle: rados_t,
 }
@@ -160,10 +187,11 @@ impl Cluster {
         }
     }
 
-    /// Open a pool given as `pool` or `pool:namespace`.
+    /// Open a pool given as `pool` or `pool:namespace`, escaped as the zone
+    /// writes it ( see parse_pool() ).
     pub fn ioctx(self: &Arc<Self>, spec: &str) -> Result<Arc<IoCtx>> {
-        let (pool, ns) = spec.split_once(':').unwrap_or((spec, ""));
-        self.ioctx_ns(pool, ns)
+        let (pool, ns) = parse_pool(spec);
+        self.ioctx_ns(&pool, &ns)
     }
 
     pub fn ioctx_ns(self: &Arc<Self>, pool: &str, ns: &str) -> Result<Arc<IoCtx>> {
@@ -176,7 +204,7 @@ impl Cluster {
                 rados_ioctx_set_namespace(io, n.as_ptr());
             }
         }
-        Ok(Arc::new(IoCtx { io, name: if ns.is_empty() { pool.to_string() } else { format!("{pool}:{ns}") }, _cluster: self.clone() }))
+        Ok(Arc::new(IoCtx { io, pool: pool.to_string(), ns: ns.to_string(), name: pool_spec(pool, ns), _cluster: self.clone() }))
     }
 
     pub fn conf_get(&self, name: &str) -> Option<String> {
@@ -215,6 +243,9 @@ impl Drop for Cluster {
 
 pub struct IoCtx {
     io: rados_ioctx_t,
+    pool: String,
+    ns: String,
+    /// the pool's spec, for messages
     pub name: String,
     _cluster: Arc<Cluster>,
 }
@@ -322,6 +353,24 @@ impl IoCtx {
                 r if r == -libc::ERANGE && len < 64 << 20 => len *= 16,
                 r => bail!("getxattr {name} of {oid} in {}: {}", self.name, std::io::Error::from_raw_os_error(-r)),
             }
+        }
+    }
+
+    /// Every xattr of an object, in one read; None if it is missing.
+    pub async fn getxattrs(&self, oid: &str) -> Result<Option<HashMap<String, Vec<u8>>>> {
+        let o = cstr(oid)?;
+        let io = Handle(self.io);
+        // librados sets the iterator when the read completes
+        let (r, (_o, iter)) = aio((o, Handle(null_mut())), move |c, b| unsafe {
+            let b = &mut *b;
+            rados_aio_getxattrs(io.ptr(), b.0.as_ptr(), c, &mut b.1.0)
+        })
+        .await;
+        match r {
+            r if r == -libc::ENOENT => Ok(None),
+            r if r < 0 => bail!("getxattrs of {oid} in {}: {}", self.name, std::io::Error::from_raw_os_error(-r)),
+            _ if iter.ptr().is_null() => bail!("getxattrs of {oid} in {}: librados returned no xattrs", self.name),
+            _ => unsafe { xattrs_of(iter.ptr()) }.map(Some).with_context(|| format!("{oid} in {}", self.name)),
         }
     }
 
@@ -494,8 +543,7 @@ impl IoCtx {
 impl IoCtx {
     /// An ioctx on the same pool whose operations use a locator.
     fn with_locator(&self, cluster: &Arc<Cluster>, loc: &str) -> Result<IoCtx> {
-        let (pool, ns) = self.name.split_once(':').unwrap_or((&self.name, ""));
-        let io = cluster.ioctx_ns(pool, ns)?;
+        let io = cluster.ioctx_ns(&self.pool, &self.ns)?;
         let key = cstr(loc)?;
         unsafe { rados_ioctx_locator_set_key(io.io, key.as_ptr()) };
         Arc::try_unwrap(io).map_err(|_| anyhow!("a fresh ioctx is shared"))
@@ -506,6 +554,16 @@ impl IoCtx {
         let (mut size, mut mtime) = (0u64, 0 as libc::time_t);
         let r = unsafe { rados_stat(self.io, o.as_ptr(), &mut size, &mut mtime) };
         if r < 0 { Err(r) } else { Ok((size, mtime as i64)) }
+    }
+
+    fn getxattrs_blocking(&self, oid: &str) -> Result<Option<HashMap<String, Vec<u8>>>> {
+        let o = cstr(oid)?;
+        let mut iter = null_mut();
+        match unsafe { rados_getxattrs(self.io, o.as_ptr(), &mut iter) } {
+            r if r == -libc::ENOENT => Ok(None),
+            r if r < 0 => bail!("getxattrs of {oid} in {}: {}", self.name, std::io::Error::from_raw_os_error(-r)),
+            _ => unsafe { xattrs_of(iter) }.map(Some).with_context(|| format!("{oid} in {}", self.name)),
+        }
     }
 
     fn getxattr_blocking(&self, oid: &str, name: &str) -> Result<Option<Vec<u8>>> {
@@ -535,9 +593,10 @@ pub struct RadosShuffle {
 impl RadosShuffle {
     pub const NAMESPACE: &'static str = "rgw-integrity-work";
 
+    /// In the pool of a spec ( see parse_pool() ), whose namespace is replaced.
     pub fn new(cluster: &Arc<Cluster>, pool: &str) -> Result<RadosShuffle> {
-        let pool = pool.split(':').next().unwrap_or(pool);
-        Ok(RadosShuffle { io: cluster.ioctx_ns(pool, Self::NAMESPACE)? })
+        let (pool, _) = parse_pool(pool);
+        Ok(RadosShuffle { io: cluster.ioctx_ns(&pool, Self::NAMESPACE)? })
     }
 }
 
@@ -559,7 +618,8 @@ impl crate::shuffle::Shuffle for RadosShuffle {
     }
 }
 
-/// The Store on a cluster: the zone's data pools, extra pools and index pools.
+/// The Store on a cluster: the data pools ( --pool's, or the zone's data and
+/// extra pools ), the zone's extra pools and its index pools.
 pub struct RadosStore {
     pub cluster: Arc<Cluster>,
     pools: Vec<Arc<IoCtx>>,
@@ -570,7 +630,7 @@ pub struct RadosStore {
 }
 
 impl RadosStore {
-    /// `data` and `extra` as `pool` or `pool:namespace`.  As rgw-gap-list.py
+    /// `data` and `extra` as pool specs ( see parse_pool() ).  As rgw-gap-list.py
     /// does, a `.non-ec` pool is also searched in its `multipart` namespace.
     pub fn new(cluster: Arc<Cluster>, data: &[String], extra: &[String], index_pools: HashMap<String, String>) -> Result<RadosStore> {
         let mut store = RadosStore { cluster, pools: Vec::new(), data: Vec::new(), extra: Vec::new(), index_pools, index: Mutex::default() };
@@ -583,9 +643,10 @@ impl RadosStore {
                         continue;
                     }
                 };
+                let non_ec = io.ns.is_empty() && io.pool.ends_with(".non-ec");
                 let mut ios = vec![io];
-                if spec.ends_with(".non-ec") {
-                    ios.push(store.cluster.ioctx_ns(spec, "multipart")?);
+                if non_ec {
+                    ios.push(store.cluster.ioctx_ns(&ios[0].pool, "multipart")?);
                 }
                 for io in ios {
                     store.pools.push(io);
@@ -597,15 +658,21 @@ impl RadosStore {
         if store.data.is_empty() {
             bail!("none of the data pools {data:?} could be opened");
         }
+        // a data pool given twice is statted in once
+        store.data = distinct_pools(&store.data, |p| store.pools[p].name.as_str());
         Ok(store)
     }
 
+    /// The pools to look in, each once: a pool that is both a data pool and
+    /// an extra pool ( as stat_pools() makes the zone's extra pools ) is
+    /// looked in at its first place.
     fn order(&self, pools: Pools) -> Vec<usize> {
-        match pools {
+        let ids: Vec<usize> = match pools {
             Pools::Data => self.data.clone(),
             Pools::ExtraFirst => self.extra.iter().chain(&self.data).copied().collect(),
             Pools::DataFirst => self.data.iter().chain(&self.extra).copied().collect(),
-        }
+        };
+        distinct_pools(&ids, |p| self.pools[p].name.as_str())
     }
 
     /// Stat a head stored under a locator, in the data pools.
@@ -668,23 +735,22 @@ impl Store for RadosStore {
         error.map_or(Stat::Missing, Stat::Error)
     }
 
-    async fn find(&self, oid: &str, pools: Pools) -> Option<(PoolId, u64, i64)> {
+    async fn locate(&self, oid: &str, pools: Pools) -> Stat {
         if let Some(loc) = crate::oid::head_locator(oid) {
-            return match self.stat_located(oid, &loc).await {
-                Stat::Found { pool, size, mtime } => Some((pool, size, mtime)),
-                _ => None,
-            };
+            return self.stat_located(oid, &loc).await;
         }
+        let mut error = None;
         for p in self.order(pools) {
             match self.pools[p].stat(oid).await {
-                Ok((size, mtime)) => return Some((PoolId(p), size, mtime)),
+                Ok((size, mtime)) => return Stat::Found { pool: PoolId(p), size, mtime },
                 Err(r) if r != -libc::ENOENT => {
-                    tracing::warn!("stat of {oid} in {}: {}", self.pools[p].name, std::io::Error::from_raw_os_error(-r))
+                    tracing::debug!("stat of {oid} in {}: {}", self.pools[p].name, std::io::Error::from_raw_os_error(-r));
+                    error = Some(r);
                 }
                 Err(_) => {}
             }
         }
-        None
+        error.map_or(Stat::Missing, Stat::Error)
     }
 
     async fn getxattr(&self, pool: PoolId, oid: &str, name: &str) -> Result<Option<Vec<u8>>> {
@@ -694,6 +760,15 @@ impl Store for RadosStore {
             return tokio::task::spawn_blocking(move || io.getxattr_blocking(&oid, &name)).await?;
         }
         self.pools[pool.0].getxattr(oid, name).await
+    }
+
+    async fn getxattrs(&self, pool: PoolId, oid: &str) -> Result<Option<HashMap<String, Vec<u8>>>> {
+        if let Some(loc) = crate::oid::head_locator(oid) {
+            let io = self.pools[pool.0].with_locator(&self.cluster, &loc)?;
+            let oid = oid.to_string();
+            return tokio::task::spawn_blocking(move || io.getxattrs_blocking(&oid)).await?;
+        }
+        self.pools[pool.0].getxattrs(oid).await
     }
 
     async fn omap_keys(&self, pool: PoolId, oid: &str, prefix: &str) -> Result<Option<Vec<String>>> {
@@ -741,6 +816,10 @@ impl Store for RadosStore {
 
     fn shuffle(&self, pool: &str) -> Result<Arc<dyn crate::shuffle::Shuffle>> {
         Ok(Arc::new(RadosShuffle::new(&self.cluster, pool)?))
+    }
+
+    fn data_pools(&self) -> Vec<String> {
+        self.data.iter().map(|&p| self.pools[p].name.clone()).collect()
     }
 
     async fn pool_objects(&self) -> Result<HashMap<String, u64>> {

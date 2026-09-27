@@ -22,7 +22,9 @@ const LIST_FLUSH: usize = 4 << 20;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub partitions: u32,
-    /// the pool ( and namespace ) clients exchange partitions in
+    /// the pool clients exchange partitions in, as a pool spec ( see
+    /// store::parse_pool() ): its namespace is replaced by the work
+    /// namespace, rgw-integrity-work
     pub work: Option<String>,
     pub created: i64,
 }

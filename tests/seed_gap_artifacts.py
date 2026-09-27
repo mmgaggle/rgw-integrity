@@ -2,8 +2,9 @@
 """
 seed_gap_artifacts.py OUT.json [fixed]: on a vstart cluster whose radosgw
 has the overwrite-race injection points and none of the fixes, leave each
-race's artifact in a bucket of its own, and write what rgw-gap-list should
-report for each bucket to OUT.json.
+race's artifact in a bucket of its own, and write what rgw-integrity should
+find in each bucket to OUT.json ( a finding's class, check, key and likely
+causes, or that the bucket is clean ), for check_findings.py.
 
 With 'fixed', the radosgw has the fixes too: the same races leave nothing,
 but for a completed upload whose meta delete failed, which the completion

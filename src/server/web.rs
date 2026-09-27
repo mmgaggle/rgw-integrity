@@ -534,8 +534,8 @@ async fn overview(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(fl
                     h2 class="rgwi-section" { "Scan" }
                     @match running {
                         Some(s) => {
-                            (progress(s.done + s.failed, s.units, &format!("Scan {} · {} of {} buckets", s.id, s.done + s.failed, s.units),
-                                &format!("{} leased · {} pending · {} failed · {} RADOS objects checked · started {}", s.leased, s.pending, s.failed, human(s.rados_objects), iso(s.created))))
+                            (progress(s.done + s.failed, s.units, &format!("Scan {} · {} of {} units", s.id, s.done + s.failed, s.units),
+                                &format!("{} leased · {} pending · {} failed{} · {} RADOS objects checked · {} missing · started {}", s.leased, s.pending, s.failed, with_errors(s), human(s.rados_objects), human(s.gaps), iso(s.created))))
                         }
                         None => {
                             @match scans.first() {
@@ -882,7 +882,7 @@ async fn clients_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Quer
             (flash(&fl))
             div class="cds--tile" {
                 h4 { "Concurrency" }
-                p class="rgwi-muted" { "Each client gets an equal share of the RADOS operations in flight, unless it has its own limit. Changes reach the clients with their next heartbeat, within 5 seconds." }
+                p class="rgwi-muted" { "The RADOS operations in flight are for the whole cluster, not per process as rgw-gap-list's -i: each client seen in the last 30 seconds gets an equal share, unless it has its own limit. Changes reach the clients with their next heartbeat, within 5 seconds." }
                 form method="post" action="/clients/controls" style="margin-top:1rem" {
                     div class="rgwi-form-row" {
                         (text_input("global_inflight", "RADOS operations in flight, across clients", &settings.global_inflight.to_string(), "number", ""))
@@ -917,7 +917,7 @@ async fn clients_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Quer
                         td { (tag(state.0, state.1)) }
                         td { (ago(c.last_seen)) }
                         td { (s.inflight_in_use) " / " (s.inflight_size) }
-                        td { @for u in &s.units { div { (u.bucket) " " span class="rgwi-muted" { (human(u.rados_objects as i64)) " objects" } } } }
+                        td { @for u in &s.units { div { (u.bucket) " " span class="rgwi-muted" { (human(u.rados_objects as i64)) " objects" @if u.gaps > 0 { ", " (human(u.gaps as i64)) " missing" } } } } }
                         td { (human(s.checked as i64)) }
                         td { (s.errors) }
                         td {
@@ -1007,7 +1007,7 @@ async fn forget_clients(AdminAuth(who): AdminAuth, State(app): State<Shared>) ->
 fn options_form(o: &Options) -> Markup {
     html! {
         div class="rgwi-form-row" {
-            (text_input("grace", "Skip findings younger than, seconds", &o.grace.to_string(), "number", ""))
+            (text_input("grace", "Leave findings younger than this to a later scan, seconds (0: report at once)", &o.grace.to_string(), "number", ""))
             (text_input("match_prefix", "Only keys starting with", o.match_prefix.as_deref().unwrap_or(""), "text", "any"))
             (text_input("threads", "Index check reads at once", &o.threads.to_string(), "number", ""))
         }
@@ -1015,7 +1015,7 @@ fn options_form(o: &Options) -> Markup {
             (checkbox("uploads", "Open multipart uploads", o.uploads))
             (checkbox("check_index", "Index entries against heads (one read per object)", o.check_index))
             (checkbox("refcount", "Tail references (one read per tail object)", o.refcount))
-            (checkbox("orphans", "Orphans (lists the data pools; every bucket)", o.orphans))
+            (checkbox("orphans", "Orphans (lists the pools scans stat in; every bucket and key)", o.orphans))
             (checkbox("radoslist", "List with radosgw-admin radoslist (slower; a unit per bucket)", o.listing == crate::scan::Listing::Radoslist))
         }
     }
@@ -1030,10 +1030,12 @@ fn options_of(f: &HashMap<String, String>) -> anyhow::Result<Options> {
         check_index: f.contains_key("check_index"),
         refcount: f.contains_key("refcount"),
         uploads: f.contains_key("uploads"),
-        match_prefix: f.get("match_prefix").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        match_prefix: crate::scan::normalise_prefix(f.get("match_prefix").map(String::as_str)),
         threads: num("threads", 32)?.clamp(1, 1024) as usize,
         orphans: f.contains_key("orphans"),
         listing: if f.contains_key("radoslist") { crate::scan::Listing::Radoslist } else { crate::scan::Listing::Native },
+        // start_scan sets it
+        every_bucket: false,
     })
 }
 
@@ -1054,7 +1056,21 @@ fn checks_label(o: &Options) -> String {
     if o.listing == crate::scan::Listing::Radoslist {
         v.push("radoslist");
     }
-    v.join(", ")
+    let mut label = v.join(", ");
+    if let Some(p) = &o.match_prefix {
+        label.push_str(&format!(", keys under {p}"));
+    }
+    label
+}
+
+/// " · N with errors", for a scan some of whose units finished with errors.
+fn with_errors(s: &db::ScanRow) -> String {
+    if s.errored > 0 { format!(" · {} with errors", s.errored) } else { String::new() }
+}
+
+/// What a unit's checks skipped, a reason a line.
+fn skipped_reasons(skipped: &std::collections::BTreeMap<String, u64>) -> String {
+    skipped.iter().map(|(why, n)| format!("{n} {why}")).collect::<Vec<_>>().join("\n")
 }
 
 fn state_color(state: &str) -> &'static str {
@@ -1080,8 +1096,8 @@ async fn scans_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(
             @match running {
                 Some(s) => {
                     div class="cds--tile" {
-                        (progress(s.done + s.failed, s.units, &format!("Scan {} · {} of {} buckets", s.id, s.done + s.failed, s.units),
-                            &format!("{} leased · {} pending · {} failed · {} RADOS objects checked", s.leased, s.pending, s.failed, human(s.rados_objects))))
+                        (progress(s.done + s.failed, s.units, &format!("Scan {} · {} of {} units", s.id, s.done + s.failed, s.units),
+                            &format!("{} leased · {} pending · {} failed{} · {} RADOS objects checked · {} missing", s.leased, s.pending, s.failed, with_errors(s), human(s.rados_objects), human(s.gaps))))
                         div class="rgwi-actions" {
                             a class="cds--btn cds--btn--tertiary cds--btn--sm" href=(format!("/scans/{}", s.id)) { "Buckets" }
                             form method="post" action=(format!("/scans/{}/cancel", s.id)) data-confirm="Cancel this scan? Clients finish their running buckets, and lease no more." {
@@ -1107,15 +1123,16 @@ async fn scans_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Query(
                 }
             }
             h2 class="rgwi-section" { "History" }
-            (table("", None, &["Scan", "State", "Started", "Took", "Buckets", "RADOS objects", "Findings", "Checks", "Note"], html! {
+            (table("", None, &["Scan", "State", "Started", "Took", "Units", "RADOS objects", "Missing", "Findings", "Checks", "Note"], html! {
                 @for s in &scans {
                     tr {
                         td { a class="cds--link" href=(format!("/scans/{}", s.id)) { (s.id) } }
                         td { (tag(state_color(&s.state), &s.state)) }
                         td { (ago(s.created)) }
                         td { @if let Some(f) = s.finished { (duration(f - s.created)) } }
-                        td { (s.done) " done" @if s.failed > 0 { ", " (s.failed) " failed" } " of " (s.units) }
+                        td { (s.done) " done" @if s.errored > 0 { " (" (s.errored) " with errors)" } @if s.failed > 0 { ", " (s.failed) " failed" } " of " (s.units) }
                         td { (human(s.rados_objects)) }
+                        td { @if s.gaps > 0 { a class="cds--link" href=(format!("/api/v1/scans/{}/missing", s.id)) title="The gap list, as rgw-gap-list writes it" { (human(s.gaps)) } } @else { "0" } }
                         td { a class="cds--link" href=(format!("/findings?scan={}&status=any", s.id)) { (s.findings) } }
                         td class="rgwi-muted" { (checks_label(&s.options)) }
                         td { (s.note) }
@@ -1143,11 +1160,12 @@ async fn start_scan(AdminAuth(who): AdminAuth, State(app): State<Shared>, Form(f
 }
 
 async fn cancel_scan(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    match app.db.call(move |c| db::cancel_scan(c, id, now())).await {
-        Ok(()) => {
+    match app.cancel_scan(id).await {
+        Ok(true) => {
             app.event("scan", format!("scan {id} cancelled by {}", who.name)).await;
             back("/scans", &format!("Scan {id} cancelled."), false).into_response()
         }
+        Ok(false) => back("/scans", &format!("Scan {id} is not running."), true).into_response(),
         Err(e) => back("/scans", &format!("{e:#}"), true).into_response(),
     }
 }
@@ -1173,19 +1191,23 @@ async fn scan_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id
                 ol class="cds--breadcrumb" { li class="cds--breadcrumb-item" { a class="cds--link" href="/scans" { "Scans" } } }
             }
             h1 class="rgwi-title" { "Scan " (id) }
-            (progress(s.done + s.failed, s.units, &format!("{} of {} buckets · {}", s.done + s.failed, s.units, s.state),
-                &format!("{} RADOS objects checked · {} findings · checks: {} · {} GC entries", human(s.rados_objects), s.findings, checks_label(&s.options), s.gc_entries)))
+            (progress(s.done + s.failed, s.units, &format!("{} of {} units · {}", s.done + s.failed, s.units, s.state),
+                &format!("{} RADOS objects checked · {} missing · {} findings{} · checks: {} · {} GC entries", human(s.rados_objects), human(s.gaps), s.findings, with_errors(&s), checks_label(&s.options), s.gc_entries)))
             form method="get" action=(format!("/scans/{id}")) class="rgwi-form-row" style="margin-top:1rem" {
                 (select("state", "Buckets", &states, state.as_deref().or(Some(""))))
                 button class="cds--btn cds--btn--ghost cds--btn--sm" type="submit" { "Show" }
+                @if s.gaps > 0 {
+                    a class="cds--btn cds--btn--tertiary cds--btn--sm" href=(format!("/api/v1/scans/{id}/missing")) title="s3://bucket/key MISSING oid lines, as rgw-gap-list writes them" { "Download the gap list" }
+                }
             }
-            (table("", Some("Leased and failed first, then by size; up to 2000. A big bucket is a unit per index shard. Orphan joins wait for every bucket and pool slice."), &["Unit", "State", "Client", "Objects", "RADOS objects", "Findings", "Took", "Attempts", "Error"], html! {
+            (table("", Some("Leased and failed first, then by size; up to 2000. A big bucket is a unit per index shard. Orphan joins wait for every bucket and pool slice."), &["Unit", "State", "Client", "Objects", "RADOS objects", "Missing", "Findings", "Skipped", "Took", "Attempts", "Error"], html! {
                 @for u in &units {
                     tr {
                         td {
                             @if u.kind == "bucket" {
                                 a class="cds--link" href=(format!("/findings?bucket={}&status=any", urlencode(&u.bucket))) { (u.bucket) }
                             } @else if let (true, Some((bucket, shard))) = (u.kind == "shard", u.bucket.rsplit_once('#')) {
+                                // the shard is a number, so the last # is the label's own
                                 a class="cds--link" href=(format!("/findings?bucket={}&status=any", urlencode(bucket))) { (bucket) }
                                 " " (tag("cyan", &format!("shard {shard}")))
                             } @else {
@@ -1196,7 +1218,9 @@ async fn scan_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id
                         td class="rgwi-mono" { (u.client.clone().unwrap_or_default()) }
                         td { (human(u.objects)) }
                         td { (u.rados_objects.map(human).unwrap_or_default()) }
+                        td { (u.gaps.map(human).unwrap_or_default()) }
                         td { (u.findings.map(|f| f.to_string()).unwrap_or_default()) }
+                        td title=(skipped_reasons(&u.skipped)) { @if !u.skipped.is_empty() { (u.skipped.values().sum::<u64>()) } }
                         td { (u.seconds.map(|s| format!("{s:.1} s")).unwrap_or_default()) }
                         td { (u.attempts) }
                         td { (u.error.clone().unwrap_or_default()) }

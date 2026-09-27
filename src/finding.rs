@@ -91,8 +91,8 @@ pub struct Cause {
     pub evidence: Option<String>,
 }
 
-/// One finding, as one line of the findings file; the same schema as
-/// rgw-gap-list.py's.
+/// One finding, as one line of the findings file.  rgw-gap-list.py writes
+/// none: its MISSING lines become findings through gaplist.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
     pub class: Class,

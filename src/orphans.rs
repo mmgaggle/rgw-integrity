@@ -9,7 +9,7 @@ use crate::admin::BucketStats;
 use crate::finding::{Class, Confidence::*, Finding, Tally, cause};
 use crate::oid::{Kind, decode_refcount, head_key, parse_oid, tag_text};
 use crate::scan::{Engine, XATTR_IDTAG, XATTR_REFCOUNT, now};
-use crate::store::{PoolId, Pools};
+use crate::store::{PoolId, Pools, Stat, strerror};
 
 #[derive(Default)]
 struct Group {
@@ -32,14 +32,22 @@ struct Head {
 }
 
 impl Engine {
-    /// The orphan's pool, size and mtime, unless it is gone, young or queued
-    /// for GC.  `before`: the objects must also be older than this, less the
-    /// grace period, as when the listings of a scan that began then left out
-    /// writes in flight.
+    /// The orphan's pool, size and mtime, unless it is gone, cannot be
+    /// statted, is young or is queued for GC.  `before`: the objects must
+    /// also be older than this, less the grace period, as when the listings
+    /// of a scan that began then left out writes in flight.
     async fn usable(&self, oid: &str, before: Option<i64>, tally: &mut Tally) -> Option<(PoolId, u64, i64)> {
-        let Some(found) = self.store.find(oid, Pools::DataFirst).await else {
-            tally.skip("orphan gone");
-            return None;
+        let found = match self.store.locate(oid, Pools::DataFirst).await {
+            Stat::Found { pool, size, mtime } => (pool, size, mtime),
+            Stat::Missing => {
+                tally.skip("orphan gone");
+                return None;
+            }
+            Stat::Error(r) => {
+                tracing::error!("stat of {oid}: {}", strerror(r));
+                tally.skip("stat failed");
+                return None;
+            }
         };
         if found.2 > now() - self.opts.grace {
             tally.skip("younger than the grace period");
@@ -63,15 +71,20 @@ impl Engine {
         oid: &str,
         found: (PoolId, u64, i64),
     ) -> &'g mut Group {
-        let refs: Vec<String> = self
-            .store
-            .getxattr(found.0, oid, XATTR_REFCOUNT)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|b| decode_refcount(&b).ok())
-            .map(|rc| rc.tags().cloned().collect())
-            .unwrap_or_default();
+        // unread references only cost the cause its copy: the orphan is one still
+        let refs: Vec<String> = match self.store.getxattr(found.0, oid, XATTR_REFCOUNT).await {
+            Ok(b) => match b.map(|b| decode_refcount(&b)).transpose() {
+                Ok(rc) => rc.map(|rc| rc.tags().cloned().collect()).unwrap_or_default(),
+                Err(e) => {
+                    tracing::error!("decoding the refcount of {oid}: {e:#}");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                tracing::error!("reading the refcount of {oid}: {e:#}");
+                Vec::new()
+            }
+        };
         let g = groups.entry(gkey).or_default();
         g.oids.push(oid.to_string());
         g.bytes += found.1;
@@ -94,7 +107,15 @@ impl Engine {
                 continue;
             }
             let Some(found) = self.usable(oid, before, &mut tally).await else { continue };
-            let idtag = self.store.getxattr(found.0, oid, XATTR_IDTAG).await.ok().flatten().map(|v| tag_text(&v));
+            // a head whose tag cannot be read may be a live one: no leak
+            let idtag = match self.store.getxattr(found.0, oid, XATTR_IDTAG).await {
+                Ok(v) => v.map(|v| tag_text(&v)),
+                Err(e) => {
+                    tracing::error!("reading {XATTR_IDTAG} of {oid}: {e:#}");
+                    tally.skip("head unreadable");
+                    continue;
+                }
+            };
             let Some(idtag) = idtag else {
                 self.add(&mut groups, (o.marker.to_string(), "orphan_other", String::new()), oid, found).await;
                 continue;
@@ -128,7 +149,15 @@ impl Engine {
                     Some(&open) => open,
                     None => {
                         let meta = format!("{marker}__multipart_{key}.{upload}.meta");
-                        let open = self.store.find(&meta, Pools::ExtraFirst).await.is_some();
+                        // a meta object that cannot be read may be there: its parts are not leaked
+                        let open = match self.store.locate(&meta, Pools::ExtraFirst).await {
+                            Stat::Found { .. } => true,
+                            Stat::Missing => false,
+                            Stat::Error(r) => {
+                                tracing::error!("stat of {meta}: {}; its upload's parts are taken for an open upload's", strerror(r));
+                                true
+                            }
+                        };
                         upload_open.insert(upload.to_string(), open);
                         open
                     }
@@ -220,5 +249,73 @@ impl Engine {
             tally.add(f);
         }
         (findings, tally)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, RwLock};
+
+    use super::*;
+    use crate::admin::Admin;
+    use crate::finding::Context;
+    use crate::limiter::Limiter;
+    use crate::scan::Options;
+    use crate::store::{MockObject, MockStore};
+
+    #[tokio::test]
+    async fn unreadable_objects_are_no_orphans() {
+        // parts of two uploads that no head names: U1's meta object is gone,
+        // U2's cannot be statted; a tail that cannot be statted either
+        let mut store = MockStore::new(1, 1);
+        let old = MockObject { mtime: 1000, ..Default::default() };
+        for oid in ["M__multipart_k.U1.1", "M__multipart_k.U2.1", "M__shadow_j.2~x_1"] {
+            store.put(0, oid, old.clone());
+        }
+        store.fail(1, "M__multipart_k.U2.meta", -libc::EPERM);
+        store.fail(0, "M__shadow_j.2~x_1", -libc::EIO);
+        let engine = Engine {
+            store: Arc::new(store),
+            admin: Arc::new(Admin::new("false".into(), None, None, crate::admin::DEFAULT_CONCURRENCY)),
+            ctx: Arc::new(Context { catalog: crate::finding::Catalog::builtin(), ..Default::default() }),
+            gc: RwLock::default(),
+            gc_min_wait: 7200,
+            limiter: Limiter::new(8),
+            opts: Options::default(),
+            partitions: None,
+            segments: Default::default(),
+        };
+        let stats: BucketStats = serde_json::from_value(json!({ "bucket": "b", "id": "ID", "marker": "M" })).unwrap();
+        let oids: Vec<String> = ["M__multipart_k.U1.1", "M__multipart_k.U2.1", "M__shadow_j.2~x_1"].map(String::from).into();
+        let (findings, tally) = engine.classify_orphans(&oids, &[("M".to_string(), stats)].into(), None).await;
+        let found: Vec<(&str, &[String])> = findings.iter().map(|f| (f.check.as_str(), f.oids.as_slice())).collect();
+        assert_eq!(found, [("orphan_parts", &["M__multipart_k.U1.1".to_string()][..])]);
+        assert_eq!(tally.skipped.get("part of an open upload"), Some(&1));
+        assert_eq!(tally.skipped.get("stat failed"), Some(&1));
+        assert_eq!(tally.skipped.get("orphan gone"), None);
+    }
+
+    #[tokio::test]
+    async fn unread_head_tag_is_no_leak() {
+        // an unlisted head whose idtag cannot be read may be a live object's:
+        // not reported as orphan_other, which reads as safe to delete
+        let mut store = MockStore::new(1, 0);
+        store.put(0, "M_k", MockObject { mtime: 1000, ..Default::default() });
+        store.read_errors.insert((0, "M_k".to_string()), -libc::EIO);
+        let engine = Engine {
+            store: Arc::new(store),
+            admin: Arc::new(Admin::new("false".into(), None, None, crate::admin::DEFAULT_CONCURRENCY)),
+            ctx: Arc::new(Context { catalog: crate::finding::Catalog::builtin(), ..Default::default() }),
+            gc: RwLock::default(),
+            gc_min_wait: 7200,
+            limiter: Limiter::new(8),
+            opts: Options::default(),
+            partitions: None,
+            segments: Default::default(),
+        };
+        let stats: BucketStats = serde_json::from_value(json!({ "bucket": "b", "id": "ID", "marker": "M" })).unwrap();
+        let (findings, tally) = engine.classify_orphans(&["M_k".to_string()], &[("M".to_string(), stats)].into(), None).await;
+        assert!(findings.is_empty(), "{:?}", findings.iter().map(|f| &f.check).collect::<Vec<_>>());
+        assert_eq!(tally.skipped.get("head unreadable"), Some(&1));
     }
 }
