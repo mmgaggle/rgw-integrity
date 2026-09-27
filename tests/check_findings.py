@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-check_findings.py EXPECTED.json SCAN.jsonl ORPHANS.jsonl: compare what
-rgw-gap-list reported with what seed_gap_artifacts.py left behind
+check_findings.py EXPECTED.json SCAN.jsonl ORPHANS.jsonl: compare the
+findings rgw-integrity reported, as JSON lines ( scan's -J, or a server's:
+/api/v1/findings?per_page=1000 | jq -c '.findings[].finding' ), with what
+seed_gap_artifacts.py left behind.  Give the same file twice for a scan
+that found orphans itself.
 """
 import json
 import sys

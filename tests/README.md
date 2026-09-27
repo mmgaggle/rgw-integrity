@@ -1,19 +1,32 @@
 # Tests
 
-`cargo test --no-default-features` runs the unit tests, without a cluster.
+`cargo test --no-default-features` runs the unit tests, without a cluster:
+the listing, the checks and the gap-list reading against an in-memory store
+( `store::MockStore`, with an emulation of cls_rgw's `bi_list` ), and the
+server's database.
 
 The rest need a vstart cluster whose radosgw has the test injection points
 of ceph/ceph#72096 ( build the `vstart` and `ceph-diff-sorted` targets ):
 
 - `seed_gap_artifacts.py` leaves the artifact of each known RGW race in a
-  bucket of its own, and writes what should be found to a JSON file.
-  `check_findings.py` compares findings with it.  Both come from
-  `rgw-gap-list-tests` in linuxkidd/ceph-misc, where `run-gap.sh` seeds a
-  fresh cluster and runs rgw-orphan-list.
+  bucket of its own ( through the radosgw's injection points ), and writes
+  what rgw-integrity should find there to a JSON file: each finding's
+  class, check, key and likely causes, or that the bucket is clean.
+  `check_findings.py` compares rgw-integrity's findings, as JSON lines,
+  with it: scan's `-J`, or a server's, which `/api/v1/findings` answers as
+  one paged object ( take `?per_page=1000` through
+  `jq -c '.findings[].finding'`, as `e2e.sh` does ).  They are
+  rgw-integrity's own tests, written for its findings: nothing published
+  in linuxkidd/ceph-misc ( main, and its `wip-gap-list-results-to-rados`
+  branch ) writes that format, and rgw-gap-list.py's results cannot be
+  checked with them.  `seed_gap_artifacts.py OUT.json fixed`
+  seeds a radosgw that has the fixes too, where the races leave ( nearly )
+  nothing.
 - `e2e.sh` runs a server and two clients on that seeded cluster: a scan over
-  TLS that must find what was seeded, a lease that lapses and goes to
-  another client, the server's concurrency and pause reaching the clients,
-  and a killed server coming back with its state in RADOS.
+  TLS, orphans included, that must find what was seeded ( `check_findings.py`
+  on the server's findings ), a lease that lapses and goes to another
+  client, the server's concurrency and pause reaching the clients, and a
+  killed server coming back with its state in RADOS.
 
 ```
 CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json PYTHON=~/venv/bin/python tests/e2e.sh
