@@ -1,0 +1,40 @@
+/* rgw-integrity's layout, on top of Carbon; IBM Plex from the server, not a CDN */
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 400; font-display: swap; src: url(/static/fonts/IBMPlexSans-Regular.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 600; font-display: swap; src: url(/static/fonts/IBMPlexSans-SemiBold.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url(/static/fonts/IBMPlexMono-Regular.woff2) format("woff2"); }
+
+body { background: var(--cds-background); color: var(--cds-text-primary); margin: 0; }
+.rgwi-main { padding: 4rem 2rem 3rem; max-width: 1600px; margin: 0 auto; }
+.rgwi-title { font-size: 1.75rem; line-height: 2.25rem; font-weight: 400; margin: 1rem 0 1.5rem; }
+.rgwi-section { font-size: 1.25rem; line-height: 1.75rem; font-weight: 400; margin: 2rem 0 1rem; }
+.rgwi-muted { color: var(--cds-text-secondary); }
+.rgwi-mono, .rgwi-json { font-family: "IBM Plex Mono", monospace; font-size: 0.8125rem; }
+.rgwi-json { background: var(--cds-layer-01); padding: 1rem; overflow-x: auto; white-space: pre; margin: 0; }
+.rgwi-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); gap: 1rem; }
+.rgwi-tile-count { font-size: 2.625rem; line-height: 3.25rem; font-weight: 300; }
+.rgwi-tile-label { font-size: 0.875rem; margin-top: 0.25rem; }
+.rgwi-tile-help { font-size: 0.75rem; color: var(--cds-text-secondary); margin-top: 0.5rem; }
+.rgwi-cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(16rem, 1fr); gap: 2rem; align-items: start; }
+.rgwi-cols-even { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 2rem; align-items: start; }
+.rgwi-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: 1rem; align-items: end; margin-bottom: 1rem; }
+.rgwi-form-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; margin-bottom: 1rem; }
+.rgwi-form-row .cds--form-item { flex: 0 1 14rem; }
+.rgwi-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 1rem 0; }
+.rgwi-facet { margin-bottom: 1.5rem; }
+.rgwi-facet h4 { font-size: 0.875rem; font-weight: 600; margin-bottom: 0.5rem; }
+.rgwi-facet a { display: flex; justify-content: space-between; padding: 0.25rem 0; }
+.rgwi-bar { height: 0.5rem; background: var(--cds-layer-accent-01); }
+.rgwi-bar > div { height: 100%; background: var(--cds-interactive); }
+.rgwi-pager { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0; }
+.rgwi-login { max-width: 28rem; margin: 6rem auto; }
+.rgwi-kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem 1.5rem; }
+.rgwi-kv dt { color: var(--cds-text-secondary); }
+.rgwi-kv dd { margin: 0; overflow-wrap: anywhere; }
+.cds--data-table td { overflow-wrap: break-word; }
+.cds--data-table td.rgwi-mono { word-break: break-all; }
+.rgwi-nowrap { white-space: nowrap; }
+.rgwi-filters .rgwi-actions { grid-column: 1 / -1; margin: 0; }
+.cds--tile h4 { margin-bottom: 1rem; }
+.cds--inline-notification { max-width: none; margin-bottom: 1rem; }
+.rgwi-refresh { display: flex; align-items: center; gap: 0.5rem; color: var(--cds-text-secondary); font-size: 0.75rem; }
+@media (max-width: 66rem) { .rgwi-cols { grid-template-columns: 1fr; } .rgwi-main { padding: 4rem 1rem 2rem; } }

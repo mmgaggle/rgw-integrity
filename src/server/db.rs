@@ -234,8 +234,12 @@ impl Filter {
         eq("check_name", &self.check);
         eq("bucket", &self.bucket);
         eq("top_cause", &self.cause);
-        eq("status", &self.status);
+        // "active": open or confirmed
+        eq("status", &self.status.clone().filter(|s| s != "active"));
         eq("confidence", &self.confidence);
+        if self.status.as_deref() == Some("active") {
+            conds.push("status IN ('open', 'confirmed')".into());
+        }
         if let Some(k) = self.key.as_ref().filter(|k| !k.is_empty()) {
             conds.push("instr(key, ?) > 0".into());
             args.push(Value::Text(k.clone()));
