@@ -168,7 +168,7 @@ struct Bucket {
     named: Mutex<HashSet<String>>,
     lc_mp: OnceCell<bool>,
     out: Mutex<Out>,
-    rados_objects: AtomicU64,
+    rados_objects: Arc<AtomicU64>,
 }
 
 impl Bucket {
@@ -317,6 +317,11 @@ impl Engine {
     /// Scan one bucket.  `stats` saves a `bucket stats` call when the caller
     /// has them.
     pub async fn scan_bucket(self: &Arc<Self>, name: &str, stats: Option<BucketStats>) -> Result<BucketReport> {
+        self.scan_bucket_with(name, stats, Arc::default()).await
+    }
+
+    /// The same, counting the RADOS objects listed in `progress` as it goes.
+    pub async fn scan_bucket_with(self: &Arc<Self>, name: &str, stats: Option<BucketStats>, progress: Arc<AtomicU64>) -> Result<BucketReport> {
         let started = Instant::now();
         let mut errors = Vec::new();
         let stats = match stats {
@@ -357,7 +362,7 @@ impl Engine {
             named: Mutex::default(),
             lc_mp: OnceCell::new(),
             out: Mutex::new(Out { errors, ..Default::default() }),
-            rados_objects: AtomicU64::new(0),
+            rados_objects: progress,
         });
 
         let gc = self.gc.read().unwrap().clone();
