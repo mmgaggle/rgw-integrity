@@ -18,6 +18,9 @@ findings in the same JSON format.
   in parallel; the server keeps state in RADOS through libcephsqlite, sets
   each client's share of a global concurrency, and can pause them.  Leases
   lapse to other clients when a client stops.
+- Orphan detection: RADOS objects in the data pools that no bucket references,
+  classified as leaks ( with their likely cause ), or as heads no listing
+  shows.  See below.
 - `import`: findings from `scan` or `rgw-gap-list.py`, into a server.
 - A dashboard, in the IBM Carbon Design System, served by the server: what
   was found, filtered by class, cause, bucket and status, with each
@@ -41,6 +44,32 @@ From a vstart cluster seeded with each known race's artifact ( see `tests/` ).
 ![Clients and their concurrency](docs/screenshots/clients.png)
 
 ![Scans](docs/screenshots/scans-dark.png)
+
+## Orphans
+
+A scan with orphans ( `"orphans": true`, the dashboard's Orphans box, or
+`scan --find-orphans` ) lists every object in the zone's data pools, and
+keeps those no bucket's listing references.  Nothing holds the whole
+cluster's names: both sides are split into partitions by a hash of the
+object's name, about a million names each.
+
+- Clients list the pools in slices ( librados's `rados_object_list_slice` ),
+  and file the names by partition; bucket scans file a 16-byte hash of each
+  name they list.  With a server, the partitions are objects in the
+  `rgw-integrity-work` namespace of the database's pool ( or `--work-pool` );
+  a standalone scan keeps them in a local directory.
+- Once every bucket and pool slice is in, a join per partition keeps the
+  names nothing references, and removes the partition.  If a bucket or a
+  slice failed, the references are incomplete, and the joins are skipped
+  rather than report false orphans.
+- What the joins keep is classified together, by bucket marker, so that an
+  unlisted head and its tail, or an upload's parts, make one finding.
+  Objects newer than the scan's start, less the grace period, are skipped,
+  as writes in flight; so are parts of open uploads, parts of uploads
+  completed since their bucket was listed, and objects queued for GC.
+
+It reads every object's name once, and holds about 90 bytes per name of a
+partition while joining it.
 
 ## Build
 

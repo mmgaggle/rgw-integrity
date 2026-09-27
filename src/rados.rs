@@ -21,6 +21,17 @@ type rados_completion_t = *mut c_void;
 type rados_read_op_t = *mut c_void;
 type rados_omap_iter_t = *mut c_void;
 type rados_callback_t = Option<unsafe extern "C" fn(rados_completion_t, *mut c_void)>;
+type rados_object_list_cursor = *mut c_void;
+
+#[repr(C)]
+struct rados_object_list_item {
+    oid_length: usize,
+    oid: *mut c_char,
+    nspace_length: usize,
+    nspace: *mut c_char,
+    locator_length: usize,
+    locator: *mut c_char,
+}
 
 unsafe extern "C" {
     fn rados_create(cluster: *mut rados_t, id: *const c_char) -> c_int;
@@ -69,6 +80,34 @@ unsafe extern "C" {
         outslen: *mut usize,
     ) -> c_int;
     fn rados_buffer_free(buf: *mut c_char);
+    fn rados_object_list_begin(io: rados_ioctx_t) -> rados_object_list_cursor;
+    fn rados_object_list_end(io: rados_ioctx_t) -> rados_object_list_cursor;
+    fn rados_object_list_cursor_free(io: rados_ioctx_t, cur: rados_object_list_cursor);
+    fn rados_object_list_cursor_cmp(io: rados_ioctx_t, lhs: rados_object_list_cursor, rhs: rados_object_list_cursor) -> c_int;
+    fn rados_object_list(
+        io: rados_ioctx_t,
+        start: rados_object_list_cursor,
+        finish: rados_object_list_cursor,
+        result_size: usize,
+        filter_buf: *const c_char,
+        filter_buf_len: usize,
+        results: *mut rados_object_list_item,
+        next: *mut rados_object_list_cursor,
+    ) -> c_int;
+    fn rados_object_list_free(result_size: usize, results: *mut rados_object_list_item);
+    fn rados_object_list_slice(
+        io: rados_ioctx_t,
+        start: rados_object_list_cursor,
+        finish: rados_object_list_cursor,
+        n: usize,
+        m: usize,
+        split_start: *mut rados_object_list_cursor,
+        split_finish: *mut rados_object_list_cursor,
+    );
+    fn rados_append(io: rados_ioctx_t, oid: *const c_char, buf: *const c_char, len: usize) -> c_int;
+    fn rados_read(io: rados_ioctx_t, oid: *const c_char, buf: *mut c_char, len: usize, off: u64) -> c_int;
+    fn rados_remove(io: rados_ioctx_t, oid: *const c_char) -> c_int;
+    fn rados_stat(io: rados_ioctx_t, oid: *const c_char, psize: *mut u64, pmtime: *mut libc::time_t) -> c_int;
 }
 
 fn check(r: c_int, what: impl FnOnce() -> String) -> Result<c_int> {
@@ -318,6 +357,132 @@ impl IoCtx {
     }
 }
 
+impl IoCtx {
+    /// List slice `slice` of `slices` of the pool, in batches; objects with
+    /// a locator are skipped, as rgw-orphan-list skips them.  Blocking.
+    pub fn list_slice_blocking(&self, slice: usize, slices: usize, mut batch: impl FnMut(Vec<String>) -> Result<()>) -> Result<u64> {
+        const PAGE: usize = 1000;
+        let io = self.io;
+        let mut listed = 0u64;
+        unsafe {
+            // librados writes into the cursors it is given, so allocate them all
+            let (begin, end) = (rados_object_list_begin(io), rados_object_list_end(io));
+            let (mut cur, finish, mut next) = (rados_object_list_begin(io), rados_object_list_begin(io), rados_object_list_begin(io));
+            let mut split_finish = finish;
+            rados_object_list_slice(io, begin, end, slice, slices.max(1), &mut cur, &mut split_finish);
+            let result = (|| -> Result<()> {
+                let mut items: Vec<rados_object_list_item> = (0..PAGE)
+                    .map(|_| rados_object_list_item {
+                        oid_length: 0,
+                        oid: null_mut(),
+                        nspace_length: 0,
+                        nspace: null_mut(),
+                        locator_length: 0,
+                        locator: null_mut(),
+                    })
+                    .collect();
+                while rados_object_list_cursor_cmp(io, cur, finish) < 0 {
+                    let r = rados_object_list(io, cur, finish, PAGE, std::ptr::null(), 0, items.as_mut_ptr(), &mut next);
+                    if r < 0 {
+                        bail!("listing {}: {}", self.name, std::io::Error::from_raw_os_error(-r));
+                    }
+                    let mut names = Vec::with_capacity(r as usize);
+                    for it in &items[..r as usize] {
+                        if it.locator_length > 0 {
+                            continue;
+                        }
+                        names.push(String::from_utf8_lossy(std::slice::from_raw_parts(it.oid as *const u8, it.oid_length)).into_owned());
+                    }
+                    rados_object_list_free(r as usize, items.as_mut_ptr());
+                    std::mem::swap(&mut cur, &mut next);
+                    listed += names.len() as u64;
+                    batch(names)?;
+                    if r == 0 {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            for c in [cur, next, finish, begin, end] {
+                rados_object_list_cursor_free(io, c);
+            }
+            result?;
+        }
+        Ok(listed)
+    }
+
+    pub fn append_blocking(&self, oid: &str, data: &[u8]) -> Result<()> {
+        let o = cstr(oid)?;
+        let r = unsafe { rados_append(self.io, o.as_ptr(), data.as_ptr() as *const c_char, data.len()) };
+        check(r, || format!("appending to {oid} in {}", self.name))?;
+        Ok(())
+    }
+
+    pub fn read_all_blocking(&self, oid: &str) -> Result<Option<Vec<u8>>> {
+        let o = cstr(oid)?;
+        let (mut size, mut mtime) = (0u64, 0 as libc::time_t);
+        let r = unsafe { rados_stat(self.io, o.as_ptr(), &mut size, &mut mtime) };
+        if r == -libc::ENOENT {
+            return Ok(None);
+        }
+        check(r, || format!("stat of {oid} in {}", self.name))?;
+        let mut out = vec![0u8; size as usize];
+        let mut off = 0usize;
+        while off < out.len() {
+            let len = (out.len() - off).min(4 << 20);
+            let r = unsafe { rados_read(self.io, o.as_ptr(), out[off..].as_mut_ptr() as *mut c_char, len, off as u64) };
+            let n = check(r, || format!("reading {oid} in {}", self.name))? as usize;
+            if n == 0 {
+                break;
+            }
+            off += n;
+        }
+        out.truncate(off);
+        Ok(Some(out))
+    }
+
+    pub fn remove_blocking(&self, oid: &str) -> Result<()> {
+        let o = cstr(oid)?;
+        let r = unsafe { rados_remove(self.io, o.as_ptr()) };
+        if r != -libc::ENOENT {
+            check(r, || format!("removing {oid} in {}", self.name))?;
+        }
+        Ok(())
+    }
+}
+
+/// Orphan detection's partitions, as objects in a pool's namespace.
+pub struct RadosShuffle {
+    io: Arc<IoCtx>,
+}
+
+impl RadosShuffle {
+    pub const NAMESPACE: &'static str = "rgw-integrity-work";
+
+    pub fn new(cluster: &Arc<Cluster>, pool: &str) -> Result<RadosShuffle> {
+        let pool = pool.split(':').next().unwrap_or(pool);
+        Ok(RadosShuffle { io: cluster.ioctx_ns(pool, Self::NAMESPACE)? })
+    }
+}
+
+#[async_trait]
+impl crate::shuffle::Shuffle for RadosShuffle {
+    async fn append(&self, name: &str, data: Vec<u8>) -> Result<()> {
+        let (io, name) = (self.io.clone(), name.to_string());
+        tokio::task::spawn_blocking(move || io.append_blocking(&name, &data)).await?
+    }
+
+    async fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let (io, name) = (self.io.clone(), name.to_string());
+        tokio::task::spawn_blocking(move || io.read_all_blocking(&name)).await?
+    }
+
+    async fn remove(&self, name: &str) -> Result<()> {
+        let (io, name) = (self.io.clone(), name.to_string());
+        tokio::task::spawn_blocking(move || io.remove_blocking(&name)).await?
+    }
+}
+
 /// The Store on a cluster: the zone's data pools, extra pools and index pools.
 pub struct RadosStore {
     pub cluster: Arc<Cluster>,
@@ -440,6 +605,33 @@ impl Store for RadosStore {
 
     fn conf_get(&self, name: &str) -> Option<String> {
         self.cluster.conf_get(name)
+    }
+
+    async fn list_slice(&self, pool: &str, slice: usize, slices: usize, tx: tokio::sync::mpsc::Sender<Vec<String>>) -> Result<u64> {
+        let io = self.cluster.ioctx(pool)?;
+        tokio::task::spawn_blocking(move || {
+            io.list_slice_blocking(slice, slices, |names| tx.blocking_send(names).map_err(|_| anyhow!("the listing's reader went away")))
+        })
+        .await?
+    }
+
+    fn shuffle(&self, pool: &str) -> Result<Arc<dyn crate::shuffle::Shuffle>> {
+        Ok(Arc::new(RadosShuffle::new(&self.cluster, pool)?))
+    }
+
+    async fn pool_objects(&self) -> Result<HashMap<String, u64>> {
+        let cluster = self.cluster.clone();
+        let out = tokio::task::spawn_blocking(move || cluster.mon_command(r#"{"prefix": "df", "format": "json"}"#)).await??;
+        let df: serde_json::Value = serde_json::from_str(&out)?;
+        Ok(df["pools"]
+            .as_array()
+            .map(|pools| {
+                pools
+                    .iter()
+                    .filter_map(|p| Some((p["name"].as_str()?.to_string(), p["stats"]["objects"].as_u64().unwrap_or(0))))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 

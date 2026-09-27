@@ -54,8 +54,19 @@ pub struct LeaseRequest {
 pub struct Unit {
     pub id: i64,
     pub scan: i64,
+    /// the bucket, or a label for a pool slice or a join
     pub bucket: String,
     pub stats: Option<BucketStats>,
+    /// bucket, list ( a pool slice ) or join ( a partition )
+    #[serde(default = "bucket_kind")]
+    pub kind: String,
+    /// a list unit's detect::Slice, a join unit's detect::Join
+    #[serde(default)]
+    pub spec: Option<serde_json::Value>,
+}
+
+fn bucket_kind() -> String {
+    "bucket".into()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,6 +81,9 @@ pub struct ScanSpec {
     pub options: Options,
     pub context: Context,
     pub gc_min_wait: i64,
+    /// orphan detection's partitions and work pool, when the scan finds orphans
+    #[serde(default)]
+    pub plan: Option<crate::detect::Plan>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

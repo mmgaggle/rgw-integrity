@@ -4,6 +4,7 @@
 
 mod admin;
 mod client;
+mod detect;
 mod finding;
 mod json_stream;
 mod limiter;
@@ -14,6 +15,7 @@ mod rados;
 mod proto;
 mod scan;
 mod server;
+mod shuffle;
 mod store;
 
 use std::collections::{BTreeSet, HashMap};
@@ -82,6 +84,12 @@ struct ServerArgs {
     /// do not connect to the cluster ( a file: database, to try the dashboard )
     #[arg(long)]
     no_ceph: bool,
+    /// the pool clients exchange orphan detection's partitions in; the
+    /// database's pool by default
+    #[arg(long)]
+    work_pool: Option<String>,
+    #[command(flatten)]
+    sizing: SizingArgs,
 }
 
 #[derive(Args)]
@@ -175,6 +183,10 @@ struct CheckArgs {
     /// concurrent head reads of the index check
     #[arg(short = 'T', long, default_value_t = 32)]
     threads: usize,
+    /// find orphans: list the data pools, and keep what no bucket references
+    /// ( scans every bucket )
+    #[arg(long)]
+    find_orphans: bool,
 }
 
 impl CheckArgs {
@@ -186,6 +198,7 @@ impl CheckArgs {
             uploads: !self.no_uploads,
             match_prefix: self.r#match.clone(),
             threads: self.threads,
+            orphans: self.find_orphans,
         }
     }
 }
@@ -218,6 +231,23 @@ struct ScanArgs {
     /// buckets scanned at once
     #[arg(long, default_value_t = 4)]
     parallel: usize,
+    /// where --find-orphans keeps its partitions; a new directory under the
+    /// system's temporary directory by default
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+    #[command(flatten)]
+    sizing: SizingArgs,
+}
+
+/// Orphan detection's sizing, instead of one partition per million objects
+/// and one pool slice per half million.
+#[derive(Args, Clone, Copy, Default)]
+struct SizingArgs {
+    #[arg(long)]
+    orphan_partitions: Option<u32>,
+    /// slices of each data pool
+    #[arg(long)]
+    orphan_slices: Option<usize>,
 }
 
 fn init_logging(verbose: u8) {
@@ -318,6 +348,7 @@ async fn engine(ceph: &CephArgs, opts: Options, inflight: usize, gc: bool) -> Re
         gc_min_wait,
         limiter: limiter::Limiter::new(inflight),
         opts,
+        partitions: None,
     }))
 }
 
@@ -363,6 +394,70 @@ fn summarize(t: &Tally, findings: &std::path::Path) {
     }
 }
 
+/// List the data pools into the partitions, and join each with the
+/// references the bucket scans filed.
+async fn find_orphans(
+    engine: &Arc<Engine>,
+    pools: &[String],
+    counts: &HashMap<String, u64>,
+    partitions: u32,
+    slices_per_pool: Option<usize>,
+    shuffle: Arc<dyn shuffle::Shuffle>,
+    started: i64,
+    parallel: usize,
+) -> Result<(Vec<finding::Finding>, Tally)> {
+    let mut slices = Vec::new();
+    for pool in pools {
+        let n = slices_per_pool.unwrap_or_else(|| detect::slices_for(counts.get(pool.split(':').next().unwrap_or(pool)).copied().unwrap_or(0))).max(1);
+        slices.extend((0..n).map(|i| detect::Slice { pool: pool.clone(), slice: i, slices: n }));
+    }
+    let listed: Vec<Result<u64>> = futures::StreamExt::collect(futures::StreamExt::buffer_unordered(
+        futures::stream::iter(slices.into_iter().map(|sl| {
+            let (engine, shuffle) = (engine.clone(), shuffle.clone());
+            async move { list_slice(&engine, &sl, partitions, shuffle.as_ref(), 0, "local").await }
+        })),
+        parallel.max(1),
+    ))
+    .await;
+    let listed: u64 = listed.into_iter().collect::<Result<Vec<_>>>()?.into_iter().sum();
+    tracing::info!("listed {listed} objects");
+    let stats = all_bucket_stats(&engine.admin).await?;
+    let markers: HashMap<String, BucketStats> = stats.into_values().map(|s| (s.marker.clone(), s)).collect();
+    let mut findings = Vec::new();
+    let mut tally = Tally::default();
+    let writers = vec!["local".to_string()];
+    let mut candidates = Vec::new();
+    for p in 0..partitions {
+        let (c, js) = detect::join(shuffle.as_ref(), 0, p, &writers).await?;
+        tracing::info!("partition {p}: {} listed, {} referenced, {} not", js.listed, js.references, js.unreferenced);
+        candidates.extend(c);
+        detect::cleanup(shuffle.as_ref(), 0, p, &writers).await?;
+    }
+    // an unlisted head and its tail can land in different partitions: classify them together
+    for unit in detect::classification_units(candidates, 20_000) {
+        let (f, t) = engine.classify_orphans(&unit, &markers, Some(started)).await;
+        findings.extend(f);
+        for (k, v) in t.skipped {
+            *tally.skipped.entry(k).or_default() += v;
+        }
+    }
+    Ok((findings, tally))
+}
+
+/// List one slice of a pool into the partitions.
+pub async fn list_slice(engine: &Engine, sl: &detect::Slice, partitions: u32, shuffle: &dyn shuffle::Shuffle, scan: i64, writer: &str) -> Result<u64> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let store = engine.store.clone();
+    let (pool, slice, slices) = (sl.pool.clone(), sl.slice, sl.slices);
+    let lister = tokio::spawn(async move { store.list_slice(&pool, slice, slices, tx).await });
+    let mut listing = detect::Listing::new(partitions);
+    while let Some(names) = rx.recv().await {
+        listing.add(names, shuffle, scan, writer).await?;
+    }
+    lister.await??;
+    listing.finish(shuffle, scan, writer).await
+}
+
 async fn scan(args: ScanArgs) -> Result<()> {
     let engine = engine(&args.ceph, args.checks.options(), args.inflight, !args.checks.no_gc).await?;
     let mut out = Output {
@@ -382,7 +477,7 @@ async fn scan(args: ScanArgs) -> Result<()> {
         let stats = all_bucket_stats(&engine.admin).await?;
         let markers: HashMap<String, BucketStats> = stats.into_values().map(|s| (s.marker.clone(), s)).collect();
         tracing::info!("classifying {} orphans", oids.len());
-        let (findings, tally) = engine.classify_orphans(&oids, &markers).await;
+        let (findings, tally) = engine.classify_orphans(&oids, &markers, None).await;
         for f in &findings {
             out.finding(f)?;
         }
@@ -403,6 +498,31 @@ async fn scan(args: ScanArgs) -> Result<()> {
             names
         };
         tracing::info!("scanning {} bucket(s)", buckets.len());
+        // orphan detection: bucket scans file their references in local partitions
+        let started = scan::now();
+        let detection = if args.checks.find_orphans {
+            if !args.bucket.is_empty() || args.bucket_file.is_some() || args.checks.r#match.is_some() {
+                anyhow::bail!("--find-orphans needs every bucket's references: no --bucket, --bucket-file or --match");
+            }
+            let pools = engine.admin.zone_pools().await?.data;
+            let counts = engine.store.pool_objects().await?;
+            let objects: u64 = pools.iter().map(|p| counts.get(p.split(':').next().unwrap_or(p)).copied().unwrap_or(0)).sum();
+            let partitions = args.sizing.orphan_partitions.unwrap_or_else(|| detect::partitions_for(objects)).max(1);
+            let dir = args.work_dir.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("rgw-integrity-{}", std::process::id())));
+            let shuffle: Arc<dyn shuffle::Shuffle> = Arc::new(shuffle::LocalShuffle::new(dir.clone())?);
+            tracing::info!("finding orphans among {objects} objects in {pools:?}, in {partitions} partitions under {}", dir.display());
+            Some((pools, counts, partitions, shuffle, dir))
+        } else {
+            None
+        };
+        let engine = match &detection {
+            Some((_, _, partitions, _, _)) => {
+                let mut e = Arc::try_unwrap(engine).map_err(|_| anyhow::anyhow!("the engine is shared"))?;
+                e.partitions = Some(*partitions);
+                Arc::new(e)
+            }
+            None => engine,
+        };
         let mut refs = RefLedger::default();
         let mut tasks = JoinSet::new();
         let mut queue = buckets.into_iter();
@@ -417,13 +537,19 @@ async fn scan(args: ScanArgs) -> Result<()> {
             }
             let Some(done) = tasks.join_next().await else { break };
             let (bucket, report) = done?;
-            let report = match report {
+            let mut report = match report {
                 Ok(r) => r,
                 Err(e) => {
+                    if detection.is_some() {
+                        anyhow::bail!("{bucket}: {e:#}; without its references, orphans cannot be told");
+                    }
                     tracing::error!("{bucket}: {e:#}");
                     continue;
                 }
             };
+            if let (Some(r), Some((_, _, _, shuffle, _))) = (report.references.take(), &detection) {
+                r.flush(shuffle.as_ref(), 0, "local").await?;
+            }
             for e in &report.errors {
                 tracing::error!("{bucket}: {e}");
             }
@@ -448,6 +574,19 @@ async fn scan(args: ScanArgs) -> Result<()> {
         }
         for f in refs.resolve(&engine.ctx) {
             out.finding(&f)?;
+        }
+        if let Some((pools, counts, partitions, shuffle, dir)) = detection {
+            let (findings, tally) =
+                find_orphans(&engine, &pools, &counts, partitions, args.sizing.orphan_slices, shuffle, started, args.parallel).await?;
+            for f in &findings {
+                out.finding(f)?;
+            }
+            for (k, v) in tally.skipped {
+                *out.tally.skipped.entry(k).or_default() += v;
+            }
+            if args.work_dir.is_none() {
+                std::fs::remove_dir_all(&dir).ok();
+            }
         }
     }
 
@@ -486,7 +625,20 @@ async fn server(args: ServerArgs) -> Result<()> {
         let (store, admin) = connect(&args.ceph).await?;
         (Some(store), admin)
     };
-    let opts = server::ServeOpts { listen: args.listen, tls, db: args.db, cephsqlite: args.cephsqlite, client_token, admin_token };
+    let work_pool = args.work_pool.clone().or_else(|| {
+        args.db.strip_prefix("ceph:").and_then(|r| r.split_once('/')).map(|(pool, _)| pool.split(':').next().unwrap_or(pool).to_string())
+    });
+    let opts = server::ServeOpts {
+        listen: args.listen,
+        tls,
+        db: args.db,
+        cephsqlite: args.cephsqlite,
+        client_token,
+        admin_token,
+        work_pool,
+        partitions: args.sizing.orphan_partitions,
+        slices: args.sizing.orphan_slices,
+    };
     server::serve(opts, admin, store, Catalog::load(args.ceph.catalog.as_deref())?).await
 }
 

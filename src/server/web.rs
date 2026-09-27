@@ -908,6 +908,7 @@ fn options_form(o: &Options) -> Markup {
             (checkbox("uploads", "Open multipart uploads", o.uploads))
             (checkbox("check_index", "Index entries against heads (one read per object)", o.check_index))
             (checkbox("refcount", "Tail references (one read per tail object)", o.refcount))
+            (checkbox("orphans", "Orphans (lists the data pools; every bucket)", o.orphans))
         }
     }
 }
@@ -923,6 +924,7 @@ fn options_of(f: &HashMap<String, String>) -> anyhow::Result<Options> {
         uploads: f.contains_key("uploads"),
         match_prefix: f.get("match_prefix").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         threads: num("threads", 32)?.clamp(1, 1024) as usize,
+        orphans: f.contains_key("orphans"),
     })
 }
 
@@ -936,6 +938,9 @@ fn checks_label(o: &Options) -> String {
     }
     if o.refcount {
         v.push("refcount");
+    }
+    if o.orphans {
+        v.push("orphans");
     }
     v.join(", ")
 }
@@ -1057,10 +1062,16 @@ async fn scan_page(_: AdminAuth, State(app): State<Shared>, Path(id): Path<i64>,
                 (select("state", "Buckets", &states, state.as_deref().or(Some(""))))
                 button class="cds--btn cds--btn--ghost cds--btn--sm" type="submit" { "Show" }
             }
-            (table("", Some("Leased and failed first, then by size; up to 2000."), &["Bucket", "State", "Client", "Objects", "RADOS objects", "Findings", "Took", "Attempts", "Error"], html! {
+            (table("", Some("Leased and failed first, then by size; up to 2000. Orphan joins wait for every bucket and pool slice."), &["Unit", "State", "Client", "Objects", "RADOS objects", "Findings", "Took", "Attempts", "Error"], html! {
                 @for u in &units {
                     tr {
-                        td { a class="cds--link" href=(format!("/findings?bucket={}&status=any", urlencode(&u.bucket))) { (u.bucket) } }
+                        td {
+                            @if u.kind == "bucket" {
+                                a class="cds--link" href=(format!("/findings?bucket={}&status=any", urlencode(&u.bucket))) { (u.bucket) }
+                            } @else {
+                                (tag("cool-gray", match u.kind.as_str() { "list" => "pool slice", "join" => "orphan join", _ => "orphan classification" })) " " (u.bucket)
+                            }
+                        }
                         td { (tag(state_color(&u.state), &u.state)) }
                         td class="rgwi-mono" { (u.client.clone().unwrap_or_default()) }
                         td { (human(u.objects)) }

@@ -127,16 +127,45 @@ async fn heartbeats(http: Arc<Http>, state: Arc<State>, limiter: Arc<Limiter>, t
     }
 }
 
-/// The engine for a scan, and the GC snapshot version it holds.
+/// The engine for a scan, the GC snapshot version it holds, and its orphan
+/// detection's partitions.
 struct ScanEngine {
+    scan: i64,
     engine: Arc<Engine>,
     gc_version: i64,
+    plan: Option<crate::detect::Plan>,
+    shuffle: Option<Arc<dyn crate::shuffle::Shuffle>>,
+    markers: tokio::sync::OnceCell<HashMap<String, crate::admin::BucketStats>>,
+}
+
+impl ScanEngine {
+    fn detection(&self) -> Result<(&crate::detect::Plan, &Arc<dyn crate::shuffle::Shuffle>)> {
+        match (&self.plan, &self.shuffle) {
+            (Some(p), Some(s)) => Ok((p, s)),
+            _ => bail!("scan {} does not find orphans", self.scan),
+        }
+    }
+
+    /// The scan's buckets by marker, which orphans are classified by.
+    async fn markers(&self, http: &Http) -> Result<&HashMap<String, crate::admin::BucketStats>> {
+        self.markers
+            .get_or_try_init(|| async {
+                let stats: Vec<crate::admin::BucketStats> = http.get(&format!("/api/v1/scan/{}/buckets", self.scan)).await?;
+                Ok(stats.into_iter().map(|s| (s.marker.clone(), s)).collect())
+            })
+            .await
+    }
 }
 
 async fn scan_engine(http: &Http, store: &Arc<dyn Store>, admin: &Arc<Admin>, limiter: &Arc<Limiter>, scan: i64, gc_version: i64) -> Result<ScanEngine> {
     let spec: ScanSpec = http.get(&format!("/api/v1/scan/{scan}")).await?;
     let gc: GcIndex = http.get(&format!("/api/v1/gc/{scan}")).await?;
     tracing::info!("scan {scan}: {} GC entries naming {} objects", gc.entries, gc.map.len());
+    let plan = spec.plan.filter(|_| spec.options.orphans);
+    let shuffle = match plan.as_ref().and_then(|p| p.work.as_deref()) {
+        Some(pool) => Some(store.shuffle(pool)?),
+        None => None,
+    };
     let engine = Engine {
         store: store.clone(),
         admin: admin.clone(),
@@ -145,8 +174,61 @@ async fn scan_engine(http: &Http, store: &Arc<dyn Store>, admin: &Arc<Admin>, li
         gc_min_wait: spec.gc_min_wait,
         limiter: limiter.clone(),
         opts: spec.options,
+        partitions: plan.as_ref().map(|p| p.partitions),
     };
-    Ok(ScanEngine { engine: Arc::new(engine), gc_version })
+    Ok(ScanEngine { scan, engine: Arc::new(engine), gc_version, plan, shuffle, markers: Default::default() })
+}
+
+/// Run one unit: scan a bucket, list a pool slice, or join a partition.
+async fn run_unit(se: Arc<ScanEngine>, http: Arc<Http>, writer: String, unit: &Unit, progress: Arc<AtomicU64>) -> Result<BucketReport> {
+    let started = std::time::Instant::now();
+    match unit.kind.as_str() {
+        "list" => {
+            let (plan, shuffle) = se.detection()?;
+            let sl: crate::detect::Slice = serde_json::from_value(unit.spec.clone().context("a pool slice without its spec")?)?;
+            let listed = crate::list_slice(&se.engine, &sl, plan.partitions, shuffle.as_ref(), se.scan, &writer).await?;
+            progress.store(listed, Ordering::Relaxed);
+            Ok(BucketReport { bucket: unit.bucket.clone(), rados_objects: listed, seconds: started.elapsed().as_secs_f64(), ..Default::default() })
+        }
+        "join" => {
+            let (_, shuffle) = se.detection()?;
+            let j: crate::detect::Join = serde_json::from_value(unit.spec.clone().context("a join without its spec")?)?;
+            let (candidates, stats) = crate::detect::join(shuffle.as_ref(), se.scan, j.partition, &j.writers).await?;
+            progress.store(stats.listed, Ordering::Relaxed);
+            tracing::info!("partition {}: {} listed, {} referenced, {} not", j.partition, stats.listed, stats.references, stats.unreferenced);
+            Ok(BucketReport {
+                bucket: unit.bucket.clone(),
+                rados_objects: stats.listed,
+                candidates,
+                seconds: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            })
+        }
+        "classify" => {
+            let (plan, _) = se.detection()?;
+            let c: crate::detect::Classify = serde_json::from_value(unit.spec.clone().context("a classification without its spec")?)?;
+            let markers = se.markers(&http).await?;
+            let (findings, tally) = se.engine.classify_orphans(&c.oids, markers, Some(plan.created)).await;
+            progress.store(c.oids.len() as u64, Ordering::Relaxed);
+            Ok(BucketReport {
+                bucket: unit.bucket.clone(),
+                rados_objects: c.oids.len() as u64,
+                findings,
+                tally,
+                seconds: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            })
+        }
+        _ => {
+            let mut r = se.engine.scan_bucket_with(&unit.bucket, unit.stats.clone(), progress).await?;
+            // the references must be in the partitions before the report says the bucket is done
+            if let Some(refs) = r.references.take() {
+                let (_, shuffle) = se.detection()?;
+                refs.flush(shuffle.as_ref(), se.scan, &writer).await?;
+            }
+            Ok(r)
+        }
+    }
 }
 
 pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> Result<()> {
@@ -182,7 +264,8 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
     });
 
     tracing::warn!("client {} reporting to {}", state.id, http.base);
-    let mut engines: HashMap<i64, ScanEngine> = HashMap::new();
+    let mut engines: HashMap<i64, Arc<ScanEngine>> = HashMap::new();
+    let mut gc_versions: HashMap<i64, i64> = HashMap::new();
     let mut running: JoinSet<(Unit, Result<BucketReport>)> = JoinSet::new();
     loop {
         let c = control.borrow_and_update().clone();
@@ -190,12 +273,12 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
         let mut leased_none = true;
         if let Some(c) = &c {
             // a newer GC snapshot of the running scan
-            if let (Some(scan), Some(se)) = (c.scan, c.scan.and_then(|s| engines.get_mut(&s))) {
-                if se.gc_version != c.gc_version {
+            if let (Some(scan), Some(se)) = (c.scan, c.scan.and_then(|s| engines.get(&s))) {
+                if se.gc_version != c.gc_version && gc_versions.get(&scan) != Some(&c.gc_version) {
                     match http.get::<GcIndex>(&format!("/api/v1/gc/{scan}")).await {
                         Ok(gc) => {
                             se.engine.set_gc(Arc::new(gc));
-                            se.gc_version = c.gc_version;
+                            gc_versions.insert(scan, c.gc_version);
                         }
                         Err(e) => tracing::error!("GC snapshot: {e:#}"),
                     }
@@ -211,7 +294,7 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
                                 match scan_engine(&http, &store, &admin, &limiter, unit.scan, c.gc_version).await {
                                     Ok(se) => {
                                         engines.retain(|s, _| Some(*s) == c.scan);
-                                        engines.insert(unit.scan, se);
+                                        engines.insert(unit.scan, Arc::new(se));
                                     }
                                     Err(e) => {
                                         tracing::error!("scan {}: {e:#}", unit.scan);
@@ -221,12 +304,13 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
                                     }
                                 }
                             }
-                            let engine = engines[&unit.scan].engine.clone();
+                            let se = engines[&unit.scan].clone();
                             let progress = Arc::new(AtomicU64::new(0));
                             state.progress.lock().unwrap().insert(unit.id, (unit.bucket.clone(), progress.clone()));
-                            tracing::info!("scanning {} ( unit {} )", unit.bucket, unit.id);
+                            tracing::info!("{} ( unit {}, {} )", unit.bucket, unit.id, unit.kind);
+                            let (http, writer) = (http.clone(), state.id.clone());
                             running.spawn(async move {
-                                let r = engine.scan_bucket_with(&unit.bucket, unit.stats.clone(), progress).await;
+                                let r = run_unit(se, http, writer, &unit, progress).await;
                                 (unit, r)
                             });
                         }
@@ -255,8 +339,19 @@ pub async fn run(opts: ClientOpts, store: Arc<dyn Store>, admin: Arc<Admin>) -> 
                         report.missing = Vec::new();
                         tracing::info!("{}: {} RADOS objects, {} findings in {:.1} s", report.bucket, report.rados_objects, report.findings.len(), report.seconds);
                         let r = Report { client: state.id.clone(), unit: unit.id, report };
-                        if let Err(e) = http.post::<_, ()>("/api/v1/report", &r).await {
-                            tracing::error!("reporting {}: {e:#}", unit.bucket);
+                        match http.post::<_, ()>("/api/v1/report", &r).await {
+                            Err(e) => tracing::error!("reporting {}: {e:#}", unit.bucket),
+                            // a joined partition's objects go once the server has its findings
+                            Ok(()) if unit.kind == "join" => {
+                                if let (Some(se), Some(spec)) = (engines.get(&unit.scan), unit.spec.clone()) {
+                                    if let (Ok(j), Ok((_, shuffle))) = (serde_json::from_value::<crate::detect::Join>(spec), se.detection()) {
+                                        if let Err(e) = crate::detect::cleanup(shuffle.as_ref(), unit.scan, j.partition, &j.writers).await {
+                                            tracing::error!("cleaning partition {}: {e:#}", j.partition);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(()) => {}
                         }
                     }
                     Err(e) => {

@@ -16,5 +16,5 @@ of ceph/ceph#72096 ( build the `vstart` and `ceph-diff-sorted` targets ):
   and a killed server coming back with its state in RADOS.
 
 ```
-CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json ORPHANS=gap-run/orphans.txt PYTHON=~/venv/bin/python tests/e2e.sh
+CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json PYTHON=~/venv/bin/python tests/e2e.sh
 ```

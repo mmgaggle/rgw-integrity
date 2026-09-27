@@ -2,10 +2,10 @@
 # e2e.sh: rgw-integrity's server and clients on a vstart cluster that
 # seed_gap_artifacts.py seeded ( see tests/README.md ).
 #
-#   CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json ORPHANS=gap-run/orphans.txt ./e2e.sh
+#   CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json ./e2e.sh
 #
-# Checks, in order: a scan by two clients over TLS finds what the seeding
-# left; a lapsed lease goes to another client; the server's concurrency and
+# Checks, in order: a scan by two clients over TLS, orphans included, finds
+# what the seeding left; a lapsed lease goes to another client; the server's concurrency and
 # pause reach the clients; and a killed server comes back with its state.
 set -u
 B=${CEPH_BUILD:?set CEPH_BUILD to a ceph build directory}
@@ -29,12 +29,17 @@ openssl x509 -req -in "$W/server.csr" -CA "$W/ca.pem" -CAkey "$W/ca.key" -CAcrea
 
 ceph osd pool create rgw-integrity 8 >/dev/null 2>&1
 ceph osd pool application enable rgw-integrity mgr >/dev/null 2>&1
-rados -p rgw-integrity ls 2>/dev/null | xargs -r -n1 rados -p rgw-integrity rm 2>/dev/null
+pkill -f "rgw-integrity (server|client)" 2>/dev/null
+# a database of its own, and nothing left from earlier runs
+DB=e2e-$(date +%s).db
+rados -p rgw-integrity ls 2>/dev/null | grep '^e2e-' | xargs -r -n1 rados -p rgw-integrity rm 2>/dev/null
+rados -p rgw-integrity -N rgw-integrity-work ls 2>/dev/null | xargs -r -n1 rados -p rgw-integrity -N rgw-integrity-work rm 2>/dev/null
 
 start_server() {
   "$BIN" server -v --listen 127.0.0.1:$PORT --tls-cert "$W/server.pem" --tls-key "$W/server.key" \
-    --db ceph:rgw-integrity/state.db --cephsqlite "$B/lib/libcephsqlite.so" \
-    --client-token-file "$W/client.token" --admin-token-file "$W/admin.token" >> "$W/server.log" 2>&1 &
+    --db ceph:rgw-integrity/$DB --cephsqlite "$B/lib/libcephsqlite.so" \
+    --client-token-file "$W/client.token" --admin-token-file "$W/admin.token" \
+    --orphan-partitions "${PARTITIONS:-5}" --orphan-slices "${SLICES:-4}" >> "$W/server.log" 2>&1 &
   SERVER=$!
   for i in $(seq 60); do curl -s --cacert "$W/ca.pem" -o /dev/null "$URL/api/v1/status" && break; sleep 1; done
 }
@@ -60,15 +65,16 @@ check "the API refuses a request without a token" '[ "$(curl -s --cacert "$W/ca.
 start_client a
 start_client b
 
-# 1. a full scan, by both clients
+# 1. a full scan, by both clients, finding orphans too
 SCAN=$(api -X POST -H 'Content-Type: application/json' \
-  --data '{"options": {"grace": 0, "check_index": true, "refcount": true, "uploads": true, "match_prefix": null, "threads": 16}}' \
+  --data '{"options": {"grace": 0, "check_index": true, "refcount": true, "uploads": true, "match_prefix": null, "threads": 16, "orphans": true}}' \
   "$URL/api/v1/scans")
 check "scan $SCAN finishes" 'wait_scan "$SCAN" 180'
 api "$URL/api/v1/findings?per_page=1000" | jq -c '.findings[].finding' > "$W/scan.jsonl"
-"$BIN" scan -c "$B/ceph.conf" --grace 0 -O "${ORPHANS:?}" -J "$W/orphans.jsonl" -o "$W/orphans-missing.txt" >> "$W/orphans.log" 2>&1
-$PY "$T/check_findings.py" "${EXPECTED:?}" "$W/scan.jsonl" "$W/orphans.jsonl" > "$W/check.txt"
-check "the clients' findings match the seeded artifacts" 'tail -1 "$W/check.txt" | grep -q "^0 problem"'
+$PY "$T/check_findings.py" "${EXPECTED:?}" "$W/scan.jsonl" "$W/scan.jsonl" > "$W/check.txt"
+check "the clients' findings, orphans included, match the seeded artifacts" 'tail -1 "$W/check.txt" | grep -q "^0 problem"'
+check "both clients listed pool slices or joined partitions" '[ "$(grep -hcE "\( unit [0-9]+, (list|join) \)" "$W"/client-*.log | grep -vc "^0$")" -ge 1 ]'
+check "the joins removed the partitions from the work pool" '[ -z "$(rados -p rgw-integrity -N rgw-integrity-work ls 2>/dev/null)" ]'
 sleep 6  # a heartbeat with the final counts
 check "both clients scanned buckets" '[ "$(api "$URL/api/v1/status" | jq "[.clients[] | select(.status.checked > 0)] | length")" -ge 2 ]'
 

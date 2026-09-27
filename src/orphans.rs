@@ -32,14 +32,21 @@ struct Head {
 }
 
 impl Engine {
-    /// The orphan's pool, size and mtime, unless it is gone, young or queued for GC.
-    async fn usable(&self, oid: &str, tally: &mut Tally) -> Option<(PoolId, u64, i64)> {
+    /// The orphan's pool, size and mtime, unless it is gone, young or queued
+    /// for GC.  `before`: the objects must also be older than this, less the
+    /// grace period, as when the listings of a scan that began then left out
+    /// writes in flight.
+    async fn usable(&self, oid: &str, before: Option<i64>, tally: &mut Tally) -> Option<(PoolId, u64, i64)> {
         let Some(found) = self.store.find(oid, Pools::DataFirst).await else {
             tally.skip("orphan gone");
             return None;
         };
         if found.2 > now() - self.opts.grace {
             tally.skip("younger than the grace period");
+            return None;
+        }
+        if before.is_some_and(|b| found.2 > b - self.opts.grace) {
+            tally.skip("written while the scan listed");
             return None;
         }
         if self.gc.read().unwrap().map.contains_key(oid) {
@@ -73,7 +80,7 @@ impl Engine {
         g
     }
 
-    pub async fn classify_orphans(&self, oids: &[String], markers: &HashMap<String, BucketStats>) -> (Vec<Finding>, Tally) {
+    pub async fn classify_orphans(&self, oids: &[String], markers: &HashMap<String, BucketStats>, before: Option<i64>) -> (Vec<Finding>, Tally) {
         let mut tally = Tally::default();
         let mut heads: Vec<Head> = Vec::new();
         let mut groups: BTreeMap<(String, &'static str, String), Group> = BTreeMap::new();
@@ -86,7 +93,7 @@ impl Engine {
             if o.kind != Kind::Head {
                 continue;
             }
-            let Some(found) = self.usable(oid, &mut tally).await else { continue };
+            let Some(found) = self.usable(oid, before, &mut tally).await else { continue };
             let idtag = self.store.getxattr(found.0, oid, XATTR_IDTAG).await.ok().flatten().map(|v| tag_text(&v));
             let Some(idtag) = idtag else {
                 self.add(&mut groups, (o.marker.to_string(), "orphan_other", String::new()), oid, found).await;
@@ -112,7 +119,7 @@ impl Engine {
                 h.tails.push(oid.clone());
                 continue;
             }
-            let Some(found) = self.usable(oid, &mut tally).await else { continue };
+            let Some(found) = self.usable(oid, before, &mut tally).await else { continue };
             let marker = o.marker.to_string();
             if !markers.contains_key(o.marker) {
                 self.add(&mut groups, (marker, "orphan_of_removed_bucket", String::new()), oid, found).await;
@@ -139,6 +146,27 @@ impl Engine {
                 self.add(&mut groups, (marker, "orphan_tail", prefix), oid, found).await;
             } else {
                 self.add(&mut groups, (marker, "orphan_other", String::new()), oid, found).await;
+            }
+        }
+
+        // parts of an upload whose completion came after its bucket was listed:
+        // the head now names them
+        let mut completed = Vec::new();
+        for ((marker, check, prefix), g) in &groups {
+            if *check != "orphan_parts" {
+                continue;
+            }
+            let (Some(st), Some(key)) = (markers.get(marker), &g.key) else { continue };
+            let names = format!("{marker}__multipart_{prefix}.");
+            if self.admin.tail_prefixes(&st.name(), key, "").await.iter().any(|p| *p == names) {
+                completed.push((marker.clone(), *check, prefix.clone()));
+            }
+        }
+        for k in completed {
+            if let Some(g) = groups.remove(&k) {
+                for _ in &g.oids {
+                    tally.skip("part of an upload completed since");
+                }
             }
         }
 

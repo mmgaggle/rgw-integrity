@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS clients (
     status TEXT NOT NULL,
     inflight_override INTEGER
 );
+CREATE TABLE IF NOT EXISTS scan_writers (
+    scan_id INTEGER NOT NULL,
+    client TEXT NOT NULL,
+    PRIMARY KEY (scan_id, client)
+);
+CREATE TABLE IF NOT EXISTS orphan_candidates (
+    scan_id INTEGER NOT NULL,
+    oid TEXT NOT NULL,
+    PRIMARY KEY (scan_id, oid)
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     time INTEGER NOT NULL,
@@ -98,6 +108,9 @@ pub const STATUSES: [&str; 4] = ["open", "confirmed", "false_positive", "gone"];
 /// bucket that no longer finds them marks them gone.
 const BUCKET_CHECKS: &str =
     "('missing_data', 'queued_for_gc', 'completed_upload_open', 'part_entries_missing', 'listed_without_head', 'stale_entry')";
+
+/// Checks whose findings come from orphan detection.
+const ORPHAN_CHECKS: &str = "('orphan_parts', 'orphan_tail', 'orphan_other', 'orphan_of_removed_bucket', 'unlisted_head')";
 
 /// Settings the dashboard controls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +171,7 @@ pub struct ScanRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitRow {
     pub id: i64,
+    pub kind: String,
     pub bucket: String,
     pub objects: i64,
     pub state: String,
@@ -297,6 +311,7 @@ impl Db {
         };
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)), location: spec.to_string() })
     }
 
@@ -309,6 +324,23 @@ impl Db {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || f(&mut conn.lock().unwrap())).await?
     }
+}
+
+/// Columns added since the first schema.
+fn migrate(c: &Connection) -> Result<()> {
+    let columns = |table: &str| -> Result<Vec<String>> {
+        let mut st = c.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = st.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<_>>()?;
+        Ok(names)
+    };
+    let units = columns("units")?;
+    if !units.iter().any(|c| c == "kind") {
+        c.execute_batch("ALTER TABLE units ADD COLUMN kind TEXT NOT NULL DEFAULT 'bucket'; ALTER TABLE units ADD COLUMN spec TEXT;")?;
+    }
+    if !columns("scans")?.iter().any(|c| c == "plan") {
+        c.execute_batch("ALTER TABLE scans ADD COLUMN plan TEXT;")?;
+    }
+    Ok(())
 }
 
 pub fn settings(c: &Connection) -> Result<Settings> {
@@ -336,7 +368,24 @@ pub fn events(c: &Connection, limit: usize) -> Result<Vec<Event>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// A new scan and its units: (bucket, objects, stats json).
+/// A unit of a new scan: a bucket to scan, a slice of a pool to list, or a
+/// partition to join; joins wait for the rest.
+pub struct NewUnit {
+    pub label: String,
+    pub kind: &'static str,
+    pub objects: u64,
+    pub stats: Option<String>,
+    pub spec: Option<String>,
+    pub blocked: bool,
+}
+
+impl NewUnit {
+    pub fn bucket(name: String, objects: u64, stats: Option<String>) -> NewUnit {
+        NewUnit { label: name, kind: "bucket", objects, stats, spec: None, blocked: false }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn insert_scan(
     c: &mut Connection,
     now: i64,
@@ -345,18 +394,27 @@ pub fn insert_scan(
     gc_min_wait: i64,
     gc_entries: usize,
     note: &str,
-    buckets: &[(String, u64, Option<String>)],
+    plan: Option<&crate::detect::Plan>,
+    units: &[NewUnit],
 ) -> Result<i64> {
     let tx = c.transaction()?;
     tx.execute(
-        "INSERT INTO scans (created, state, options, context, gc_min_wait, gc_entries, note) VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6)",
-        params![now, serde_json::to_string(options)?, serde_json::to_string(context)?, gc_min_wait, gc_entries as i64, note],
+        "INSERT INTO scans (created, state, options, context, gc_min_wait, gc_entries, note, plan) VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            now,
+            serde_json::to_string(options)?,
+            serde_json::to_string(context)?,
+            gc_min_wait,
+            gc_entries as i64,
+            note,
+            plan.map(serde_json::to_string).transpose()?
+        ],
     )?;
     let id = tx.last_insert_rowid();
     {
-        let mut st = tx.prepare("INSERT OR IGNORE INTO units (scan_id, bucket, objects, stats, state) VALUES (?1, ?2, ?3, ?4, 'pending')")?;
-        for (bucket, objects, stats) in buckets {
-            st.execute(params![id, bucket, *objects as i64, stats])?;
+        let mut st = tx.prepare("INSERT OR IGNORE INTO units (scan_id, bucket, objects, stats, state, kind, spec) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        for u in units {
+            st.execute(params![id, u.label, u.objects as i64, u.stats, if u.blocked { "blocked" } else { "pending" }, u.kind, u.spec])?;
         }
     }
     tx.commit()?;
@@ -368,14 +426,76 @@ pub fn running_scan(c: &Connection) -> Result<Option<i64>> {
 }
 
 pub fn scan_spec(c: &Connection, id: i64) -> Result<Option<crate::proto::ScanSpec>> {
-    let row: Option<(String, String, i64)> = c
-        .query_row("SELECT options, context, gc_min_wait FROM scans WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let row: Option<(String, String, i64, Option<String>)> = c
+        .query_row("SELECT options, context, gc_min_wait, plan FROM scans WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
-    row.map(|(o, ctx, w)| {
-        Ok(crate::proto::ScanSpec { id, options: serde_json::from_str(&o)?, context: serde_json::from_str(&ctx)?, gc_min_wait: w })
+    row.map(|(o, ctx, w, plan)| {
+        Ok(crate::proto::ScanSpec {
+            id,
+            options: serde_json::from_str(&o)?,
+            context: serde_json::from_str(&ctx)?,
+            gc_min_wait: w,
+            plan: plan.map(|p| serde_json::from_str(&p)).transpose()?,
+        })
     })
     .transpose()
 }
+
+/// The clients that leased any unit of a scan: the ones that may have
+/// written its partitions.
+pub fn scan_writers(c: &Connection, scan: i64) -> Result<Vec<String>> {
+    let mut st = c.prepare("SELECT client FROM scan_writers WHERE scan_id = ?1 ORDER BY client")?;
+    let rows = st.query_map([scan], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The stats of the buckets a scan covers.
+pub fn scan_buckets(c: &Connection, scan: i64) -> Result<Vec<crate::admin::BucketStats>> {
+    let mut st = c.prepare("SELECT stats FROM units WHERE scan_id = ?1 AND kind = 'bucket' AND stats IS NOT NULL")?;
+    let rows = st.query_map([scan], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for s in rows {
+        if let Ok(st) = serde_json::from_str(&s?) {
+            out.push(st);
+        }
+    }
+    Ok(out)
+}
+
+/// Once every bucket and pool slice of a scan is in, let its joins be
+/// leased; if any failed, the references are incomplete, so cancel them.
+pub fn unblock_joins(c: &Connection, scan: i64) -> Result<Option<String>> {
+    let count = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [scan], |r| r.get(0))?) };
+    let blocked = count("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind = 'join' AND state = 'blocked'")?;
+    if blocked == 0 {
+        return Ok(None);
+    }
+    if count("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind != 'join' AND state IN ('pending', 'leased')")? > 0 {
+        return Ok(None);
+    }
+    let failed = count("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind != 'join' AND state = 'failed'")?;
+    if failed > 0 {
+        c.execute(
+            "UPDATE units SET state = 'cancelled', error = 'a bucket or pool slice failed, so its references are incomplete'
+             WHERE scan_id = ?1 AND kind = 'join' AND state = 'blocked'",
+            [scan],
+        )?;
+        return Ok(Some(format!("scan {scan}: {failed} buckets or pool slices failed; orphan detection skipped")));
+    }
+    let writers = scan_writers(c, scan)?;
+    let joins: Vec<(i64, String)> = {
+        let mut st = c.prepare("SELECT id, spec FROM units WHERE scan_id = ?1 AND kind = 'join' AND state = 'blocked'")?;
+        st.query_map([scan], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, spec) in &joins {
+        let mut j: crate::detect::Join = serde_json::from_str(spec)?;
+        j.writers = writers.clone();
+        c.execute("UPDATE units SET state = 'pending', spec = ?1 WHERE id = ?2", params![serde_json::to_string(&j)?, id])?;
+    }
+    Ok(Some(format!("scan {scan}: every bucket and pool slice is in; {} partitions to join", joins.len())))
+}
+
+
 
 pub fn scans(c: &Connection, limit: usize) -> Result<Vec<ScanRow>> {
     let mut st = c.prepare(
@@ -413,7 +533,7 @@ pub fn scans(c: &Connection, limit: usize) -> Result<Vec<ScanRow>> {
 
 pub fn units(c: &Connection, scan: i64, state: Option<&str>, limit: usize) -> Result<Vec<UnitRow>> {
     let mut st = c.prepare(
-        "SELECT id, bucket, objects, state, client, attempts, started, finished, rados_objects, findings, seconds, error
+        "SELECT id, bucket, objects, state, client, attempts, started, finished, rados_objects, findings, seconds, error, kind
          FROM units WHERE scan_id = ?1 AND (?2 IS NULL OR state = ?2)
          ORDER BY CASE state WHEN 'leased' THEN 0 WHEN 'failed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END, objects DESC LIMIT ?3",
     )?;
@@ -431,6 +551,7 @@ pub fn units(c: &Connection, scan: i64, state: Option<&str>, limit: usize) -> Re
             findings: r.get(9)?,
             seconds: r.get(10)?,
             error: r.get(11)?,
+            kind: r.get(12)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -440,17 +561,30 @@ pub fn units(c: &Connection, scan: i64, state: Option<&str>, limit: usize) -> Re
 pub fn lease(c: &mut Connection, client: &str, max: usize, now: i64, lease_secs: i64) -> Result<Vec<Unit>> {
     let tx = c.transaction()?;
     let Some(scan) = running_scan(&tx)? else { return Ok(Vec::new()) };
-    let picked: Vec<(i64, String, Option<String>)> = {
-        let mut st = tx.prepare("SELECT id, bucket, stats FROM units WHERE scan_id = ?1 AND state = 'pending' ORDER BY objects DESC, id LIMIT ?2")?;
-        st.query_map(params![scan, max as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+    let picked: Vec<(i64, String, Option<String>, String, Option<String>)> = {
+        let mut st = tx.prepare(
+            "SELECT id, bucket, stats, kind, spec FROM units WHERE scan_id = ?1 AND state = 'pending' ORDER BY objects DESC, id LIMIT ?2",
+        )?;
+        st.query_map(params![scan, max as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<rusqlite::Result<_>>()?
     };
+    if !picked.is_empty() {
+        tx.execute("INSERT OR IGNORE INTO scan_writers (scan_id, client) VALUES (?1, ?2)", params![scan, client])?;
+    }
     let mut units = Vec::new();
-    for (id, bucket, stats) in picked {
+    for (id, bucket, stats, kind, spec) in picked {
         tx.execute(
             "UPDATE units SET state = 'leased', client = ?1, lease_expires = ?2, started = COALESCE(started, ?3) WHERE id = ?4",
             params![client, now + lease_secs, now, id],
         )?;
-        units.push(Unit { id, scan, bucket, stats: stats.and_then(|s| serde_json::from_str(&s).ok()) });
+        units.push(Unit {
+            id,
+            scan,
+            bucket,
+            stats: stats.and_then(|s| serde_json::from_str(&s).ok()),
+            kind,
+            spec: spec.and_then(|s| serde_json::from_str(&s).ok()),
+        });
     }
     tx.commit()?;
     Ok(units)
@@ -555,6 +689,9 @@ pub fn complete(c: &mut Connection, scan: i64, unit: i64, client: &str, r: &crat
             tx.execute("UPDATE refs SET carried = ?1 WHERE scan_id = ?2 AND oid = ?3", params![serde_json::to_string(&c)?, scan, oid])?;
         }
     }
+    for oid in &r.candidates {
+        tx.execute("INSERT OR IGNORE INTO orphan_candidates (scan_id, oid) VALUES (?1, ?2)", params![scan, oid])?;
+    }
     let errors = if r.errors.is_empty() { None } else { Some(r.errors.join("; ")) };
     tx.execute(
         "UPDATE units SET state = 'done', finished = ?1, rados_objects = ?2, gaps = ?3, findings = ?4, seconds = ?5,
@@ -566,9 +703,40 @@ pub fn complete(c: &mut Connection, scan: i64, unit: i64, client: &str, r: &crat
     Ok(())
 }
 
+/// Once every join of a scan is in, queue the classification of what they
+/// found unreferenced, in units that keep each bucket's objects together.
+pub fn plan_classification(c: &Connection, scan: i64) -> Result<Option<String>> {
+    let count = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [scan], |r| r.get(0))?) };
+    if count("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind = 'join'")? == 0
+        || count("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind = 'join' AND state IN ('pending', 'leased', 'blocked')")? > 0
+        || count("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind = 'classify'")? > 0
+    {
+        return Ok(None);
+    }
+    let candidates: Vec<String> = {
+        let mut st = c.prepare("SELECT oid FROM orphan_candidates WHERE scan_id = ?1")?;
+        st.query_map([scan], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let n = candidates.len();
+    let units = crate::detect::classification_units(candidates, 20_000);
+    let total = units.len();
+    for (i, oids) in units.into_iter().enumerate() {
+        let spec = serde_json::to_string(&crate::detect::Classify { oids })?;
+        c.execute(
+            "INSERT INTO units (scan_id, bucket, objects, state, kind, spec) VALUES (?1, ?2, 0, 'pending', 'classify', ?3)",
+            params![scan, format!("orphans, classification {}/{total}", i + 1), spec],
+        )?;
+    }
+    Ok(Some(format!("scan {scan}: {n} objects nothing references, to classify in {total} units")))
+}
+
 /// Whether every unit of the scan is done or failed.
 pub fn scan_complete(c: &Connection, scan: i64) -> Result<bool> {
-    let open: i64 = c.query_row("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND state IN ('pending', 'leased')", [scan], |r| r.get(0))?;
+    let open: i64 =
+        c.query_row("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND state IN ('pending', 'leased', 'blocked')", [scan], |r| r.get(0))?;
     Ok(open == 0)
 }
 
@@ -598,7 +766,28 @@ pub fn finish_scan(c: &mut Connection, scan: i64, ctx: &crate::finding::Context,
         ),
         [scan],
     )?;
+    // a complete orphan detection that no longer finds an orphan
+    let joins: (i64, i64) = tx.query_row(
+        "SELECT SUM(kind = 'join'), SUM(state = 'done') FROM units WHERE scan_id = ?1 AND kind IN ('join', 'classify')",
+        [scan],
+        |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+    )?;
+    let classify: i64 = tx.query_row("SELECT COUNT(*) FROM units WHERE scan_id = ?1 AND kind = 'classify'", [scan], |r| r.get(0))?;
+    let gone = gone
+        + if joins.0 > 0 && joins.0 + classify == joins.1 {
+            tx.execute(
+                &format!(
+                    "UPDATE findings SET status = 'gone'
+                     WHERE status IN ('open', 'confirmed') AND check_name IN {ORPHAN_CHECKS}
+                       AND last_scan IS NOT NULL AND last_scan < ?1"
+                ),
+                [scan],
+            )?
+        } else {
+            0
+        };
     tx.execute("DELETE FROM refs WHERE scan_id = ?1", [scan])?;
+    tx.execute("DELETE FROM orphan_candidates WHERE scan_id = ?1", [scan])?;
     tx.execute("UPDATE scans SET state = 'done', finished = ?1 WHERE id = ?2", params![now, scan])?;
     tx.commit()?;
     Ok((leaks.len(), gone))
@@ -606,7 +795,7 @@ pub fn finish_scan(c: &mut Connection, scan: i64, ctx: &crate::finding::Context,
 
 pub fn cancel_scan(c: &Connection, scan: i64, now: i64) -> Result<()> {
     c.execute("UPDATE scans SET state = 'cancelled', finished = ?1 WHERE id = ?2 AND state = 'running'", params![now, scan])?;
-    c.execute("UPDATE units SET state = 'cancelled' WHERE scan_id = ?1 AND state IN ('pending', 'leased')", [scan])?;
+    c.execute("UPDATE units SET state = 'cancelled' WHERE scan_id = ?1 AND state IN ('pending', 'leased', 'blocked')", [scan])?;
     Ok(())
 }
 
@@ -743,7 +932,7 @@ mod tests {
         let c2 = ctx.clone();
         let scan = db
             .call(move |c| {
-                insert_scan(c, 100, &Options::default(), &c2, 7200, 0, "", &[("small".into(), 1, None), ("big".into(), 10, None), ("mid".into(), 5, None)])
+                insert_scan(c, 100, &Options::default(), &c2, 7200, 0, "", None, &[NewUnit::bucket("small".into(), 1, None), NewUnit::bucket("big".into(), 10, None), NewUnit::bucket("mid".into(), 5, None)])
             })
             .await
             .unwrap();
@@ -774,7 +963,7 @@ mod tests {
         // a second scan of the bucket that no longer finds it marks it gone
         let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
         let c2 = ctx.clone();
-        let scan2 = db.call(move |c| insert_scan(c, 900, &Options::default(), &c2, 7200, 0, "", &[("big".into(), 10, None)])).await.unwrap();
+        let scan2 = db.call(move |c| insert_scan(c, 900, &Options::default(), &c2, 7200, 0, "", None, &[NewUnit::bucket("big".into(), 10, None)])).await.unwrap();
         let u = db.call(|c| lease(c, "a", 1, 900, 60)).await.unwrap();
         let uid = u[0].id;
         db.call(move |c| complete(c, scan2, uid, "a", &BucketReport::default(), 950)).await.unwrap();
@@ -786,12 +975,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn joins_wait_for_the_rest() {
+        let db = db();
+        let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
+        let join = |p: u32| NewUnit {
+            label: format!("partition {p}"),
+            kind: "join",
+            objects: 0,
+            stats: None,
+            spec: Some(serde_json::to_string(&crate::detect::Join { partition: p, writers: vec![] }).unwrap()),
+            blocked: true,
+        };
+        let units = vec![NewUnit::bucket("b".into(), 1, None), join(0), join(1)];
+        let scan = db.call(move |c| insert_scan(c, 1, &Options::default(), &ctx, 7200, 0, "", None, &units)).await.unwrap();
+        let first = db.call(|c| lease(c, "a:1", 5, 1, 60)).await.unwrap();
+        assert_eq!(first.len(), 1, "the joins wait");
+        assert!(db.call(move |c| unblock_joins(c, scan)).await.unwrap().is_none());
+        let uid = first[0].id;
+        db.call(move |c| complete(c, scan, uid, "a:1", &BucketReport::default(), 2)).await.unwrap();
+        assert!(db.call(move |c| unblock_joins(c, scan)).await.unwrap().is_some());
+        let joins = db.call(|c| lease(c, "b:2", 5, 3, 60)).await.unwrap();
+        assert_eq!(joins.len(), 2);
+        let j: crate::detect::Join = serde_json::from_value(joins[0].spec.clone().unwrap()).unwrap();
+        assert_eq!(j.writers, vec!["a:1".to_string()]);
+    }
+
+    #[tokio::test]
     async fn references_merge_across_buckets() {
         // a copy in another bucket carries the tag the source's tail holds
         let db = db();
         let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
         let c2 = ctx.clone();
-        let scan = db.call(move |c| insert_scan(c, 1, &Options::default(), &c2, 7200, 0, "", &[("src".into(), 2, None), ("dst".into(), 1, None)])).await.unwrap();
+        let scan = db.call(move |c| insert_scan(c, 1, &Options::default(), &c2, 7200, 0, "", None, &[NewUnit::bucket("src".into(), 2, None), NewUnit::bucket("dst".into(), 1, None)])).await.unwrap();
         let units = db.call(|c| lease(c, "a", 2, 1, 60)).await.unwrap();
         let (src, dst) = (units[0].id, units[1].id);
         let tail = "m__shadow_.x_1".to_string();

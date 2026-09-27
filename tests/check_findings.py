@@ -17,6 +17,12 @@ def load(path):
 
 expected = json.load(open(sys.argv[1]))
 got = {'scan': load(sys.argv[2]), 'orphans': load(sys.argv[3])}
+# one file with both: a scan that found orphans itself
+together = sys.argv[2] == sys.argv[3]
+if together:
+    for e in expected:
+        e['via'] = 'scan'
+    got['orphans'] = []
 failed = 0
 
 

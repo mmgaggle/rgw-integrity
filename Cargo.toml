@@ -14,6 +14,7 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
+flate2 = "1.1.10"
 futures = "0.3.34"
 hex = "0.4.3"
 libc = "0.2.189"
@@ -31,6 +32,7 @@ toml = "1.1.6"
 tower-http = { version = "0.7.1", features = ["compression-gzip", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [features]
 default = ["ceph"]

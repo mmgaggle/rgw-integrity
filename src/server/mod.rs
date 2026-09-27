@@ -42,6 +42,11 @@ pub struct App {
     gc: RwLock<Option<(i64, i64, Arc<Vec<u8>>)>>,
     starting: tokio::sync::Mutex<()>,
     pub secure_cookies: bool,
+    /// where clients exchange orphan detection's partitions
+    pub work_pool: Option<String>,
+    /// orphan detection's sizing, instead of the objects' count
+    pub partitions: Option<u32>,
+    pub slices: Option<usize>,
 }
 
 pub type Shared = Arc<App>;
@@ -156,38 +161,112 @@ impl App {
         let settings = self.settings().await?;
         let ctx = self.context(&settings).await?;
         let gc_min_wait = self.store.as_ref().and_then(|s| s.conf_get("rgw_gc_obj_min_wait")).and_then(|v| v.parse().ok()).unwrap_or(7200);
-        let mut buckets = Vec::new();
+        if req.options.orphans && (!req.buckets.is_empty() || req.options.match_prefix.is_some()) {
+            bail!("finding orphans needs every bucket's references: scan every bucket, and every key");
+        }
+        let mut units = Vec::new();
         let mut rx = self.admin.all_bucket_stats();
         while let Some(st) = rx.recv().await {
             let st = st?;
             let name = st.name();
             if req.buckets.is_empty() || req.buckets.contains(&name) {
-                buckets.push((name, st.num_objects(), Some(serde_json::to_string(&st)?)));
+                units.push(db::NewUnit::bucket(name, st.num_objects(), Some(serde_json::to_string(&st)?)));
             }
         }
         for b in &req.buckets {
-            if !buckets.iter().any(|(n, _, _)| n == b) {
-                buckets.push((b.clone(), 0, None));
+            if !units.iter().any(|u| &u.label == b) {
+                units.push(db::NewUnit::bucket(b.clone(), 0, None));
             }
         }
-        if buckets.is_empty() {
+        if units.is_empty() {
             bail!("there are no buckets to scan");
         }
+        let buckets = units.len();
+        let plan = if req.options.orphans { Some(self.plan_orphans(&mut units).await?) } else { None };
         let snapshot = if gc { Some(GcIndex::load(&self.admin).await?) } else { None };
         let entries = snapshot.as_ref().map_or(0, |g| g.entries);
-        let (options, note, count) = (req.options.clone(), req.note.clone(), buckets.len());
-        let id = self.db.call(move |c| db::insert_scan(c, now(), &options, &ctx, gc_min_wait, entries, &note, &buckets)).await?;
+        let (options, note) = (req.options.clone(), req.note.clone());
+        let what = match &plan {
+            Some(p) => format!(", and orphans in {} partitions of {} pool slices", p.partitions, units.len() - buckets - p.partitions as usize),
+            None => String::new(),
+        };
+        let id = self.db.call(move |c| db::insert_scan(c, now(), &options, &ctx, gc_min_wait, entries, &note, plan.as_ref(), &units)).await?;
         let json = serde_json::to_vec(&snapshot.unwrap_or_default())?;
         *self.gc.write().unwrap() = Some((id, now(), Arc::new(json)));
-        self.event("scan", format!("scan {id} started: {count} buckets, {entries} GC entries")).await;
+        self.event("scan", format!("scan {id} started: {buckets} buckets{what}, {entries} GC entries")).await;
         Ok(id)
     }
 
-    /// Close the scan if its last unit is in.
-    async fn maybe_finish(&self, scan: i64) -> Result<()> {
+    /// Orphan detection: a unit per slice of each data pool, and a join per
+    /// partition that waits for them and the buckets.
+    async fn plan_orphans(&self, units: &mut Vec<db::NewUnit>) -> Result<crate::detect::Plan> {
+        let Some(work) = self.work_pool.clone() else {
+            bail!("finding orphans needs a pool to exchange partitions in: start the server with a ceph: database, or --work-pool");
+        };
+        let Some(store) = &self.store else { bail!("finding orphans needs the cluster") };
+        let pools = self.admin.zone_pools().await?.data;
+        let counts = store.pool_objects().await?;
+        let count = |p: &String| counts.get(p.split(':').next().unwrap_or(p)).copied().unwrap_or(0);
+        let partitions = self.partitions.unwrap_or_else(|| crate::detect::partitions_for(pools.iter().map(count).sum())).max(1);
+        for pool in &pools {
+            let n = self.slices.unwrap_or_else(|| crate::detect::slices_for(count(pool))).max(1);
+            for i in 0..n {
+                let spec = crate::detect::Slice { pool: pool.clone(), slice: i, slices: n };
+                units.push(db::NewUnit {
+                    label: format!("{pool} slice {}/{n}", i + 1),
+                    kind: "list",
+                    objects: count(pool) / n as u64,
+                    stats: None,
+                    spec: Some(serde_json::to_string(&spec)?),
+                    blocked: false,
+                });
+            }
+        }
+        for p in 0..partitions {
+            let spec = crate::detect::Join { partition: p, writers: Vec::new() };
+            units.push(db::NewUnit {
+                label: format!("orphans, partition {}/{partitions}", p + 1),
+                kind: "join",
+                objects: 0,
+                stats: None,
+                spec: Some(serde_json::to_string(&spec)?),
+                blocked: true,
+            });
+        }
+        Ok(crate::detect::Plan { partitions, work: Some(work), created: now() })
+    }
+
+    /// Remove what a scan's orphan detection left in the work pool.
+    async fn clean_partitions(&self, scan: i64) {
+        let Some(store) = self.store.clone() else { return };
+        let Ok(Some(spec)) = self.db.call(move |c| db::scan_spec(c, scan)).await else { return };
+        let Some(plan) = spec.plan else { return };
+        let (Some(work), Ok(writers)) = (plan.work, self.db.call(move |c| db::scan_writers(c, scan)).await) else { return };
+        let shuffle = match store.shuffle(&work) {
+            Ok(s) => s,
+            Err(e) => return tracing::error!("cleaning scan {scan}'s partitions: {e:#}"),
+        };
+        for p in 0..plan.partitions {
+            if let Err(e) = crate::detect::cleanup(shuffle.as_ref(), scan, p, &writers).await {
+                return tracing::error!("cleaning scan {scan}'s partitions: {e:#}");
+            }
+        }
+    }
+
+    /// Let a scan's joins go once the rest is in, and close the scan when
+    /// its last unit is.
+    async fn maybe_finish(self: &Arc<Self>, scan: i64) -> Result<()> {
+        if let Some(msg) = self.db.call(move |c| db::unblock_joins(c, scan)).await? {
+            self.event("scan", msg).await;
+        }
+        if let Some(msg) = self.db.call(move |c| db::plan_classification(c, scan)).await? {
+            self.event("scan", msg).await;
+        }
         if !self.db.call(move |c| db::scan_complete(c, scan)).await? {
             return Ok(());
         }
+        let app = self.clone();
+        tokio::spawn(async move { app.clean_partitions(scan).await });
         let Some(spec) = self.db.call(move |c| db::scan_spec(c, scan)).await? else { return Ok(()) };
         let ctx = spec.context;
         let (leaks, gone) = self.db.call(move |c| db::finish_scan(c, scan, &ctx, now())).await?;
@@ -276,6 +355,10 @@ async fn lease(_: ClientAuth, State(app): State<Shared>, Json(req): Json<LeaseRe
     let max = req.max.min(settings.parallel.max(1));
     let units = app.db.call(move |c| db::lease(c, &req.client, max, now(), settings.lease_secs)).await?;
     Ok(Json(Leased { units }))
+}
+
+async fn scan_buckets(_: ClientAuth, State(app): State<Shared>, UrlPath(id): UrlPath<i64>) -> ApiResult<Json<Vec<crate::admin::BucketStats>>> {
+    Ok(Json(app.db.call(move |c| db::scan_buckets(c, id)).await?))
 }
 
 async fn scan_spec(_: ClientAuth, State(app): State<Shared>, UrlPath(id): UrlPath<i64>) -> ApiResult<Json<ScanSpec>> {
@@ -380,6 +463,7 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v1/heartbeat", post(heartbeat))
         .route("/api/v1/lease", post(lease))
         .route("/api/v1/scan/{id}", get(scan_spec))
+        .route("/api/v1/scan/{id}/buckets", get(scan_buckets))
         .route("/api/v1/gc/{scan}", get(gc_snapshot))
         .route("/api/v1/report", post(report))
         .route("/api/v1/fail", post(failure))
@@ -423,6 +507,9 @@ pub struct ServeOpts {
     pub cephsqlite: String,
     pub client_token: String,
     pub admin_token: String,
+    pub work_pool: Option<String>,
+    pub partitions: Option<u32>,
+    pub slices: Option<usize>,
 }
 
 pub async fn serve(opts: ServeOpts, admin: Arc<Admin>, store: Option<Arc<dyn Store>>, catalog: Catalog) -> Result<()> {
@@ -438,6 +525,9 @@ pub async fn serve(opts: ServeOpts, admin: Arc<Admin>, store: Option<Arc<dyn Sto
         gc: RwLock::new(None),
         starting: tokio::sync::Mutex::new(()),
         secure_cookies: opts.tls.is_some(),
+        work_pool: opts.work_pool,
+        partitions: opts.partitions,
+        slices: opts.slices,
     });
     app.event("server", format!("started, state in {}", app.db.location)).await;
     tokio::spawn(app.clone().housekeeping());

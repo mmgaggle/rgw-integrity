@@ -46,11 +46,14 @@ pub struct Options {
     pub match_prefix: Option<String>,
     /// concurrent head reads of the index check
     pub threads: usize,
+    /// find orphans: RADOS objects in the data pools that no bucket references
+    #[serde(default)]
+    pub orphans: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { grace: 3600, check_index: false, refcount: false, uploads: true, match_prefix: None, threads: 32 }
+        Options { grace: 3600, check_index: false, refcount: false, uploads: true, match_prefix: None, threads: 32, orphans: false }
     }
 }
 
@@ -140,6 +143,12 @@ pub struct BucketReport {
     pub refs: RefLedger,
     pub seconds: f64,
     pub errors: Vec<String>,
+    /// the bucket's references, by partition, when the scan finds orphans
+    #[serde(skip)]
+    pub references: Option<crate::detect::Refs>,
+    /// a join's objects that nothing references, to classify with the rest
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +265,9 @@ pub struct Engine {
     pub gc_min_wait: i64,
     pub limiter: Arc<Limiter>,
     pub opts: Options,
+    /// the partitions of the scan's orphan detection, which bucket scans
+    /// file their references in
+    pub partitions: Option<u32>,
 }
 
 fn copy_self_why() -> String {
@@ -371,14 +383,22 @@ impl Engine {
         // bound the S3 objects in flight, so a fast listing cannot outrun the stats
         let groups = Arc::new(Semaphore::new(4096));
         let mut cur: Option<Group> = None;
+        let mut references = self.partitions.map(crate::detect::Refs::new);
         while let Some(line) = rx.recv().await {
             let (oid, b, key) = match line {
                 Ok(l) => l,
                 Err(e) => {
+                    // a partial listing would make orphans of what it missed
+                    if references.is_some() {
+                        return Err(e.context(format!("listing {name}")));
+                    }
                     bucket.out.lock().unwrap().errors.push(format!("{e:#}"));
                     break;
                 }
             };
+            if let Some(r) = references.as_mut() {
+                r.add(&oid);
+            }
             if let Some(p) = &self.opts.match_prefix {
                 if !key.starts_with(p.as_str()) {
                     continue;
@@ -440,6 +460,8 @@ impl Engine {
             refs: out.refs,
             seconds: started.elapsed().as_secs_f64(),
             errors: out.errors,
+            references,
+            candidates: Vec::new(),
         })
     }
 

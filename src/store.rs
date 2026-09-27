@@ -49,6 +49,16 @@ pub trait Store: Send + Sync {
 
     /// A config option, as this client sees it.
     fn conf_get(&self, name: &str) -> Option<String>;
+
+    /// List slice `slice` of `slices` of a pool ( `pool` or `pool:namespace` ),
+    /// sending the names in batches; returns how many.
+    async fn list_slice(&self, pool: &str, slice: usize, slices: usize, tx: tokio::sync::mpsc::Sender<Vec<String>>) -> Result<u64>;
+
+    /// The number of objects in each pool.
+    async fn pool_objects(&self) -> Result<HashMap<String, u64>>;
+
+    /// Where orphan detection exchanges its partitions, in a pool.
+    fn shuffle(&self, pool: &str) -> Result<std::sync::Arc<dyn crate::shuffle::Shuffle>>;
 }
 
 /// An in-memory Store, for tests.
@@ -61,6 +71,8 @@ pub struct MockStore {
     pub objects: HashMap<(usize, String), MockObject>,
     pub index: HashMap<(String, String), Vec<String>>,
     pub majors: BTreeSet<u32>,
+    /// what a pool listing returns, by pool name
+    pub listing: HashMap<String, Vec<String>>,
 }
 
 #[derive(Default, Clone)]
@@ -130,5 +142,25 @@ impl Store for MockStore {
 
     fn conf_get(&self, _name: &str) -> Option<String> {
         None
+    }
+
+    async fn list_slice(&self, pool: &str, slice: usize, slices: usize, tx: tokio::sync::mpsc::Sender<Vec<String>>) -> Result<u64> {
+        let names: Vec<String> = self
+            .listing
+            .get(pool)
+            .map(|all| all.iter().enumerate().filter(|(i, _)| i % slices.max(1) == slice).map(|(_, n)| n.clone()).collect())
+            .unwrap_or_default();
+        let n = names.len() as u64;
+        tx.send(names).await?;
+        Ok(n)
+    }
+
+    async fn pool_objects(&self) -> Result<HashMap<String, u64>> {
+        Ok(self.listing.iter().map(|(p, n)| (p.clone(), n.len() as u64)).collect())
+    }
+
+    fn shuffle(&self, pool: &str) -> Result<std::sync::Arc<dyn crate::shuffle::Shuffle>> {
+        let dir = std::env::temp_dir().join(format!("rgwi-mock-{}-{pool}", std::process::id()));
+        Ok(std::sync::Arc::new(crate::shuffle::LocalShuffle::new(dir)?))
     }
 }
