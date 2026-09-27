@@ -17,7 +17,7 @@ use tokio::task::JoinSet;
 use crate::admin::{Admin, BucketStats, IndexEntry};
 use crate::finding::{Candidate, Class, Confidence, Context, Finding, Tally, cause};
 use crate::limiter::Limiter;
-use crate::oid::{Kind, decode_refcount, index_objects, iso, key_oid, parse_oid, parse_time, split_key, survives_gc, tag_text};
+use crate::oid::{Kind, decode_refcount, iso, key_oid, parse_oid, parse_time, split_key, survives_gc, tag_text};
 use crate::store::{PoolId, Pools, Stat, Store};
 
 pub const XATTR_IDTAG: &str = "user.rgw.idtag";
@@ -49,11 +49,32 @@ pub struct Options {
     /// find orphans: RADOS objects in the data pools that no bucket references
     #[serde(default)]
     pub orphans: bool,
+    /// how buckets are listed: natively, from the index and the manifests,
+    /// shard by shard; or with radosgw-admin bucket radoslist
+    #[serde(default)]
+    pub listing: Listing,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Listing {
+    #[default]
+    Native,
+    Radoslist,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { grace: 3600, check_index: false, refcount: false, uploads: true, match_prefix: None, threads: 32, orphans: false }
+        Options {
+            grace: 3600,
+            check_index: false,
+            refcount: false,
+            uploads: true,
+            match_prefix: None,
+            threads: 32,
+            orphans: false,
+            listing: Listing::Native,
+        }
     }
 }
 
@@ -204,6 +225,8 @@ struct Group {
     bucket: String,
     key: String,
     oids: Vec<String>,
+    /// the index entry, from a native listing
+    entry: Option<crate::decode::DirEntry>,
     uploads: BTreeSet<String>,
     open_uploads: BTreeSet<String>,
     gc: Vec<(String, Vec<(String, Option<i64>)>)>,
@@ -217,6 +240,7 @@ impl Group {
             bucket,
             key,
             oids: Vec::new(),
+            entry: None,
             uploads: BTreeSet::new(),
             open_uploads: BTreeSet::new(),
             gc: Vec::new(),
@@ -301,13 +325,13 @@ impl Engine {
 
     /// The bucket's open uploads and their parts' entries, from its index:
     /// only keys in the multipart namespace, filtered by the OSDs.
-    async fn list_open_uploads(&self, stats: &BucketStats) -> Result<HashMap<String, Upload>> {
+    async fn list_open_uploads(&self, stats: &BucketStats, shard: Option<u32>) -> Result<HashMap<String, Upload>> {
         let mut uploads: HashMap<String, Upload> = HashMap::new();
         if !stats.index_type.is_empty() && stats.index_type != "Normal" {
             return Ok(uploads);
         }
         let placement = stats.placement();
-        for oid in index_objects(&stats.id, stats.num_shards, stats.index_generation) {
+        for oid in crate::native::shard_objects(stats, shard) {
             let Some(keys) = self.store.index_keys(&placement, &oid, "_multipart_").await? else {
                 anyhow::bail!("index object {oid} of {} not found", stats.name());
             };
@@ -329,11 +353,18 @@ impl Engine {
     /// Scan one bucket.  `stats` saves a `bucket stats` call when the caller
     /// has them.
     pub async fn scan_bucket(self: &Arc<Self>, name: &str, stats: Option<BucketStats>) -> Result<BucketReport> {
-        self.scan_bucket_with(name, stats, Arc::default()).await
+        self.scan_bucket_with(name, stats, Arc::default(), None).await
     }
 
     /// The same, counting the RADOS objects listed in `progress` as it goes.
-    pub async fn scan_bucket_with(self: &Arc<Self>, name: &str, stats: Option<BucketStats>, progress: Arc<AtomicU64>) -> Result<BucketReport> {
+    /// `shard`: only that index shard of the bucket.
+    pub async fn scan_bucket_with(
+        self: &Arc<Self>,
+        name: &str,
+        stats: Option<BucketStats>,
+        progress: Arc<AtomicU64>,
+        shard: Option<u32>,
+    ) -> Result<BucketReport> {
         let started = Instant::now();
         let mut errors = Vec::new();
         let stats = match stats {
@@ -348,13 +379,13 @@ impl Engine {
         };
         let mut uploads = HashMap::new();
         if let (true, Some(st)) = (self.opts.uploads, &stats) {
-            match self.list_open_uploads(st).await {
+            match self.list_open_uploads(st, shard).await {
                 Ok(u) => uploads = u,
                 Err(e) => {
                     // resharded since the stats were read?
                     match self.admin.bucket_stats(name).await {
                         Ok(fresh) if fresh.index_generation != st.index_generation || fresh.num_shards != st.num_shards => {
-                            uploads = self.list_open_uploads(&fresh).await.unwrap_or_else(|e| {
+                            uploads = self.list_open_uploads(&fresh, shard).await.unwrap_or_else(|e| {
                                 errors.push(format!("{e:#}"));
                                 HashMap::new()
                             })
@@ -378,15 +409,22 @@ impl Engine {
         });
 
         let gc = self.gc.read().unwrap().clone();
-        let mut rx = self.admin.radoslist(name);
+        let native = self.opts.listing == Listing::Native && bucket.stats.is_some();
+        if self.opts.listing == Listing::Native && !native {
+            bucket.out.lock().unwrap().errors.push("no bucket stats, so listed with radoslist".into());
+        }
+        let mut rx = match (&bucket.stats, native) {
+            (Some(st), true) => self.native_seeds(st.clone(), shard),
+            _ if shard.is_some() => anyhow::bail!("a shard of {name} can only be listed natively"),
+            _ => crate::native::radoslist_seeds(self.admin.radoslist(name)),
+        };
         let mut tasks = JoinSet::new();
         // bound the S3 objects in flight, so a fast listing cannot outrun the stats
         let groups = Arc::new(Semaphore::new(4096));
-        let mut cur: Option<Group> = None;
         let mut references = self.partitions.map(crate::detect::Refs::new);
-        while let Some(line) = rx.recv().await {
-            let (oid, b, key) = match line {
-                Ok(l) => l,
+        while let Some(seed) = rx.recv().await {
+            let seed = match seed {
+                Ok(s) => s,
                 Err(e) => {
                     // a partial listing would make orphans of what it missed
                     if references.is_some() {
@@ -396,52 +434,83 @@ impl Engine {
                     break;
                 }
             };
+            if let Some(err) = &seed.error {
+                if references.is_some() {
+                    anyhow::bail!("{err}; without it, orphans cannot be told");
+                }
+                bucket.out.lock().unwrap().errors.push(err.clone());
+            }
             if let Some(r) = references.as_mut() {
-                r.add(&oid);
+                for oid in &seed.oids {
+                    r.add(oid);
+                }
             }
             if let Some(p) = &self.opts.match_prefix {
-                if !key.starts_with(p.as_str()) {
+                if !seed.key.starts_with(p.as_str()) {
                     continue;
                 }
             }
-            bucket.rados_objects.fetch_add(1, Ordering::Relaxed);
-            if cur.as_ref().is_none_or(|g| g.bucket != b || g.key != key) {
-                if let Some(g) = cur.take() {
-                    let permit = groups.clone().acquire_owned().await?;
-                    let (engine, bucket) = (self.clone(), bucket.clone());
-                    tasks.spawn(async move {
-                        engine.process_group(&bucket, g).await;
-                        drop(permit);
-                    });
+            bucket.rados_objects.fetch_add(seed.oids.len() as u64, Ordering::Relaxed);
+            // open uploads' parts are references; their uploads are checked on their own
+            if seed.parts {
+                continue;
+            }
+            // an upload's meta object or part entry names its upload; only a head
+            // ( a completed object ) makes it one this check reaches
+            let object = seed.oids.iter().any(|o| parse_oid(o).kind == Kind::Head);
+            let mut g = Group::new(seed.bucket, seed.key);
+            g.entry = seed.entry;
+            g.present = seed.found;
+            for oid in seed.oids {
+                let o = parse_oid(&oid);
+                if let (Some(upload), true, true) = (o.upload, o.kind.is_multipart(), object) {
+                    g.uploads.insert(upload.to_string());
+                    if bucket.uploads.get(upload).is_some_and(|u| u.meta) {
+                        g.open_uploads.insert(upload.to_string());
+                        bucket.named.lock().unwrap().insert(upload.to_string());
+                    }
                 }
-                cur = Some(Group::new(b, key));
-            }
-            let g = cur.as_mut().expect("set above");
-            let o = parse_oid(&oid);
-            // radoslist lists an open upload's meta object too; only parts name an upload
-            if let (Some(upload), true) = (o.upload, o.kind.is_multipart()) {
-                g.uploads.insert(upload.to_string());
-                if bucket.uploads.get(upload).is_some_and(|u| u.meta) {
-                    g.open_uploads.insert(upload.to_string());
-                    bucket.named.lock().unwrap().insert(upload.to_string());
+                if let Some(entries) = gc.map.get(&oid) {
+                    g.gc.push((oid.clone(), entries.clone()));
                 }
+                g.oids.push(oid);
             }
-            if let Some(entries) = gc.map.get(&oid) {
-                g.gc.push((oid.clone(), entries.clone()));
-            }
-            g.oids.push(oid);
-        }
-        if let Some(g) = cur.take() {
+            let permit = groups.clone().acquire_owned().await?;
             let (engine, bucket) = (self.clone(), bucket.clone());
-            tasks.spawn(async move { engine.process_group(&bucket, g).await });
+            tasks.spawn(async move {
+                engine.process_group(&bucket, g).await;
+                drop(permit);
+            });
         }
         while let Some(r) = tasks.join_next().await {
             r?;
         }
 
+        // radoslist --rgw-obj-fs leaves out open uploads' parts: name them here
+        if let (false, Some(refs), Some(st)) = (native, references.as_mut(), &bucket.stats) {
+            let listed;
+            let uploads = if self.opts.uploads {
+                &bucket.uploads
+            } else {
+                listed = self.list_open_uploads(st, None).await?;
+                &listed
+            };
+            for (upload, u) in uploads.iter().filter(|(_, u)| u.meta) {
+                let meta = format!("_multipart_{}.{upload}.meta", u.key);
+                let Some(seed) = self.parts_seed(name, &st.marker, &meta).await else { continue };
+                if let Some(err) = seed.error {
+                    anyhow::bail!("{err}; without it, orphans cannot be told");
+                }
+                bucket.rados_objects.fetch_add(seed.oids.len() as u64, Ordering::Relaxed);
+                for oid in &seed.oids {
+                    refs.add(oid);
+                }
+            }
+        }
+
         if bucket.stats.is_some() {
             self.finalize_uploads(&bucket).await;
-            if self.opts.check_index {
+            if self.opts.check_index && !native {
                 if let Err(e) = self.check_index(&bucket).await {
                     bucket.out.lock().unwrap().errors.push(format!("index check: {e:#}"));
                 }
@@ -466,7 +535,9 @@ impl Engine {
     }
 
     async fn process_group(&self, bucket: &Bucket, mut g: Group) {
-        let stats: Vec<(String, Stat)> = futures::stream::iter(g.oids.clone())
+        // what the listing found needs no stat
+        let unseen: Vec<String> = g.oids.iter().filter(|o| !g.present.iter().any(|(p, _)| p == *o)).cloned().collect();
+        let stats: Vec<(String, Stat)> = futures::stream::iter(unseen)
             .map(|oid| async move {
                 let _permit = self.limiter.acquire().await;
                 let s = self.store.stat(&oid).await;
@@ -492,6 +563,11 @@ impl Engine {
             }
         }
         let head = g.head().cloned();
+        if let (true, Some(e), Some(h)) = (self.opts.check_index, g.entry.clone(), head.as_deref()) {
+            if g.missing.is_empty() {
+                self.check_entry(bucket, &g, &e, h).await;
+            }
+        }
         if !g.missing.is_empty() {
             self.classify_missing(bucket, &g, head.as_deref()).await;
         } else if !g.gc.is_empty() {
@@ -558,9 +634,20 @@ impl Engine {
     async fn classify_missing(&self, bucket: &Bucket, g: &Group, head: Option<&str>) {
         let (name, instance) = split_key(&g.key);
         if head.is_none_or(|h| g.missing.iter().any(|m| m == h)) {
-            let Some(entry) = self.admin.index_entry(&bucket.name, name, instance).await else {
+            let entry = match &g.entry {
+                Some(e) => Some(IndexEntry::from_dir(e)),
+                // radoslist writes the key; the index holds it escaped
+                None => {
+                    let escaped = if name.starts_with('_') { format!("_{name}") } else { name.to_string() };
+                    self.admin.index_entry(&bucket.name, &escaped, instance).await
+                }
+            };
+            let Some(entry) = entry else {
                 return bucket.skip("deleted during the scan");
             };
+            if entry.name.starts_with("_multipart_") {
+                return bucket.skip("an open upload's meta object or part");
+            }
             if entry.is_delete_marker() {
                 return bucket.skip("delete marker");
             }
@@ -726,6 +813,33 @@ impl Engine {
             let c = cause("refused-complete", High, "the upload's meta object lists parts that have no bucket index entries".to_string());
             bucket.emit(self.ctx.rank(f, vec![c], Some(meta.mtime)));
         }
+    }
+
+    /// A native listing's index entry against its head: a stale entry lists
+    /// an older object than the head holds.
+    async fn check_entry(&self, bucket: &Bucket, g: &Group, e: &crate::decode::DirEntry, head: &str) {
+        if e.name.starts_with("_multipart_") || e.pending > 0 || e.is_delete_marker() {
+            return;
+        }
+        let Some(info) = self.head_info(head).await else { return };
+        if info.mtime >= bucket.start - 1 || self.young(Some(info.mtime)) {
+            return;
+        }
+        if info.etag.is_none() || info.etag.as_deref() == Some(e.etag.as_str()) {
+            return;
+        }
+        let f = Finding::new(Class::Inconsistency, "stale_entry", &bucket.name)
+            .key(&g.key)
+            .evidence(json!({
+                "entry_etag": e.etag, "entry_mtime": iso(e.mtime), "entry_tag": e.tag,
+                "head_etag": info.etag, "head_idtag": info.idtag, "head_mtime": iso(info.mtime),
+            }))
+            .hint("ListObjects reports the older object's ETag and size; re-link the key from its head (radosgw-admin object reindex, where available)");
+        let causes = vec![
+            cause("stalled-write", Medium, "a write that stalled past the pending-op expiry leaves the index listing the object it replaced".to_string()),
+            cause("stale-entry", Medium, "completions applied out of order leave the index listing an older object".to_string()),
+        ];
+        bucket.emit(self.ctx.rank(f, causes, Some(info.mtime)));
     }
 
     /// Index entries that list an older object than their head holds.

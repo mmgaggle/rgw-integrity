@@ -41,8 +41,14 @@ pub trait Store: Send + Sync {
     /// The omap keys of an object in a pool that start with a prefix.
     async fn omap_keys(&self, pool: PoolId, oid: &str, prefix: &str) -> Result<Option<Vec<String>>>;
 
+    /// The same, with their values.
+    async fn omap_vals(&self, pool: PoolId, oid: &str, prefix: &str) -> Result<Option<Vec<(String, Vec<u8>)>>>;
+
     /// The same, for an object in a placement target's index pool.
     async fn index_keys(&self, placement: &str, oid: &str, prefix: &str) -> Result<Option<Vec<String>>>;
+
+    /// Call an object class method on an index shard; None if it does not exist.
+    async fn index_exec(&self, placement: &str, oid: &str, cls: &str, method: &str, input: Vec<u8>) -> Result<Option<Vec<u8>>>;
 
     /// The major versions the cluster's RGWs and OSDs run.
     async fn majors(&self) -> Result<BTreeSet<u32>>;
@@ -133,6 +139,10 @@ impl Store for MockStore {
             .map(|o| o.omap.iter().filter(|k| k.starts_with(prefix)).cloned().collect()))
     }
 
+    async fn omap_vals(&self, pool: PoolId, oid: &str, prefix: &str) -> Result<Option<Vec<(String, Vec<u8>)>>> {
+        Ok(self.omap_keys(pool, oid, prefix).await?.map(|keys| keys.into_iter().map(|k| (k, Vec::new())).collect()))
+    }
+
     async fn index_keys(&self, placement: &str, oid: &str, prefix: &str) -> Result<Option<Vec<String>>> {
         Ok(self
             .index
@@ -142,6 +152,10 @@ impl Store for MockStore {
 
     async fn majors(&self) -> Result<BTreeSet<u32>> {
         Ok(self.majors.clone())
+    }
+
+    async fn index_exec(&self, _placement: &str, _oid: &str, _cls: &str, _method: &str, _input: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        anyhow::bail!("the mock store has no object classes")
     }
 
     fn conf_get(&self, _name: &str) -> Option<String> {

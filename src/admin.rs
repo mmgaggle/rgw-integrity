@@ -127,6 +127,21 @@ impl IndexEntry {
         self.flags & FLAG_DELETE_MARKER != 0
     }
 
+    /// The same fields, from a natively decoded entry.
+    pub fn from_dir(e: &crate::decode::DirEntry) -> IndexEntry {
+        IndexEntry {
+            kind: "plain".into(),
+            name: e.name.clone(),
+            instance: e.instance.clone(),
+            exists: e.exists,
+            flags: e.flags as u64,
+            pending: e.pending > 0,
+            tag: e.tag.clone(),
+            etag: e.etag.clone(),
+            mtime: crate::oid::iso(e.mtime),
+        }
+    }
+
     pub fn mtime(&self) -> Option<i64> {
         parse_time(&self.mtime)
     }
@@ -190,7 +205,7 @@ impl Admin {
     }
 
     /// radoslist's lines: (RADOS object, bucket, key), all of one S3 object's
-    /// together.
+    /// together; the stripes of open uploads' parts last, with no key.
     pub fn radoslist(&self, bucket: &str) -> mpsc::Receiver<Result<(String, String, String)>> {
         let (tx, rx) = mpsc::channel(16384);
         let fs = format!("--rgw-obj-fs={FS}");
@@ -204,7 +219,12 @@ impl Admin {
                 for line in reader.split(b'\n') {
                     let line = String::from_utf8_lossy(&line?).into_owned();
                     let mut fields = line.splitn(3, FS);
-                    let (Some(oid), Some(b), Some(key)) = (fields.next(), fields.next(), fields.next()) else { continue };
+                    let (oid, b, key) = match (fields.next(), fields.next(), fields.next()) {
+                        (Some(oid), Some(b), Some(key)) => (oid, b, key),
+                        // the stripes of an open upload's parts come with no bucket or key
+                        (Some(oid), None, None) if !oid.is_empty() => (oid, bucket.as_str(), ""),
+                        _ => continue,
+                    };
                     if tx.blocking_send(Ok((oid.to_string(), b.to_string(), key.to_string()))).is_err() {
                         let _ = child.kill();
                         return Ok(());
@@ -272,7 +292,8 @@ impl Admin {
         entries
             .iter()
             .map(IndexEntry::from_value)
-            .find(|e| (e.kind == "plain" || e.kind == "instance") && e.name == name && e.instance == instance)
+            // a versioned key's placeholder ( flag VER_MARKER ) is not a listing entry
+            .find(|e| (e.kind == "plain" || e.kind == "instance") && e.name == name && e.instance == instance && e.flags & 0x8 == 0)
     }
 
     pub fn bi_list(&self, bucket: &str) -> mpsc::Receiver<Result<Value>> {

@@ -14,14 +14,16 @@ findings in the same JSON format.
 
 - `scan`: a standalone scan from one host, the equivalent of
   `rgw-gap-list.py` with its classification.
-- `server` and `client`: clients lease buckets from the server and scan them
-  in parallel; the server keeps state in RADOS through libcephsqlite, sets
+- `server` and `client`: clients lease buckets, or the index shards of big
+  ones, from the server and scan them in parallel; the server keeps state in RADOS through libcephsqlite, sets
   each client's share of a global concurrency, and can pause them.  Leases
   lapse to other clients when a client stops.
 - Orphan detection: RADOS objects in the data pools that no bucket references,
   classified as leaks ( with their likely cause ), or as heads no listing
   shows.  See below.
 - `import`: findings from `scan` or `rgw-gap-list.py`, into a server.
+- `list`: a bucket's RADOS objects, or one index shard's, in the format of
+  `radosgw-admin bucket radoslist --rgw-obj-fs`, read natively.
 - A dashboard, in the IBM Carbon Design System, served by the server: what
   was found, filtered by class, cause, bucket and status, with each
   finding's evidence and triage; the clients, with the global concurrency
@@ -73,6 +75,42 @@ rgw-integrity server ... --public-url https://rgwi.example.com:8443 \
   token still works as the API's bearer token, and clients keep theirs.
 
 ![Logging in](docs/screenshots/login-dark.png)
+
+## Listing
+
+A bucket's RADOS objects come from its own index and heads, not from
+`radosgw-admin bucket radoslist`: each index shard is paged through cls_rgw's
+`bi_list`, each entry's head is read for its manifest ( `user.rgw.manifest` ),
+and the manifest is walked as RGW's `obj_iterator` walks it; an open upload's
+parts come from the part records in its meta object.  This is several times
+faster than radoslist, reads nothing through RGW, and works a shard at a
+time: every entry of a key ( its versions, its OLH, its uploads' meta and
+part entries ) is in the shard its name hashes to, so each shard can be
+checked on its own.
+
+A bucket with more than `--shard-units-above` S3 objects ( 100,000 ) over
+several shards becomes a unit per shard, which a server spreads over its
+clients, and a standalone scan over its `--parallel` tasks.  The findings of
+a sharded bucket are marked gone only once every shard is scanned.
+
+`tests/compare_listing.sh` checks the native listing against radoslist,
+object for object, and each shard's listing against the whole, on buckets
+`tests/seed_listing_corpus.py` fills with sizes around the head and stripe
+boundaries, multipart uploads open and completed, copies within and across
+buckets, versions and delete markers, keys starting with `_`, a tenant's
+bucket, and an index resharded to 13 shards.  They agree but where
+radoslist is wrong:
+
+- radoslist lists the heads of delete markers, which do not exist.
+- With `--rgw-obj-fs`, radoslist leaves out open uploads' parts
+  ( `RGWRadosList::run` returns before `do_incomplete_multipart` ).
+- For a versioned key starting with `_`, radoslist names the key's OLH
+  from its escaped index name: an object that does not exist, instead of the
+  one that does.  Orphan lists built on radoslist report that OLH as an
+  orphan, and gap lists report a missing object.
+
+`--radoslist` ( or the dashboard's radoslist box ) lists with radosgw-admin
+instead, a unit per bucket.
 
 ## Orphans
 
@@ -133,6 +171,7 @@ curl --cacert ca.pem -H "Authorization: Bearer $(cat admin.token)" -H 'Content-T
 rgw-integrity scan -v                     # every bucket
 rgw-integrity scan -v -b bucket1 -I -R    # one bucket, with the per-object checks
 rgw-integrity scan -v -O orphan-list-*.out  # classify rgw-orphan-list output
+rgw-integrity list -b bucket1 --shard 3     # one index shard's RADOS objects
 ```
 
 Runs where `radosgw-admin` works, as client.admin by default ( `--id` ).

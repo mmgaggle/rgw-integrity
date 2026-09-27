@@ -4,10 +4,12 @@
 
 mod admin;
 mod client;
+mod decode;
 mod detect;
 mod finding;
 mod json_stream;
 mod limiter;
+mod native;
 mod oid;
 mod orphans;
 #[cfg(feature = "ceph")]
@@ -52,6 +54,29 @@ enum Cmd {
     Client(ClientArgs),
     /// Send a findings file ( rgw-integrity scan, or rgw-gap-list.py ) to a server
     Import(ImportArgs),
+    /// List a bucket's RADOS objects as radosgw-admin bucket radoslist
+    /// --rgw-obj-fs does, from its index shards and manifests
+    List(ListArgs),
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[command(flatten)]
+    ceph: CephArgs,
+    #[arg(short, long)]
+    bucket: String,
+    /// only this index shard
+    #[arg(long)]
+    shard: Option<u32>,
+    /// run radosgw-admin bucket radoslist instead, to compare
+    #[arg(long, conflicts_with = "shard")]
+    radoslist: bool,
+    /// between the RADOS object, the bucket and the key
+    #[arg(long, default_value = "\t")]
+    separator: String,
+    /// heads read at once
+    #[arg(long, default_value_t = 256)]
+    inflight: usize,
 }
 
 #[derive(Args)]
@@ -266,6 +291,10 @@ struct CheckArgs {
     /// ( scans every bucket )
     #[arg(long)]
     find_orphans: bool,
+    /// list buckets with radosgw-admin bucket radoslist, instead of reading
+    /// their index shards and manifests natively
+    #[arg(long)]
+    radoslist: bool,
 }
 
 impl CheckArgs {
@@ -278,6 +307,7 @@ impl CheckArgs {
             match_prefix: self.r#match.clone(),
             threads: self.threads,
             orphans: self.find_orphans,
+            listing: if self.radoslist { scan::Listing::Radoslist } else { scan::Listing::Native },
         }
     }
 }
@@ -322,6 +352,10 @@ struct ScanArgs {
 /// and one pool slice per half million.
 #[derive(Args, Clone, Copy, Default)]
 struct SizingArgs {
+    /// scan a bucket of more S3 objects than this a shard at a time: each
+    /// index shard a unit of its own ( with the native listing )
+    #[arg(long, default_value_t = 100_000)]
+    shard_units_above: u64,
     #[arg(long)]
     orphan_partitions: Option<u32>,
     /// slices of each data pool
@@ -604,14 +638,23 @@ async fn scan(args: ScanArgs) -> Result<()> {
         };
         let mut refs = RefLedger::default();
         let mut tasks = JoinSet::new();
-        let mut queue = buckets.into_iter();
+        // a unit per bucket, or per index shard of a big one
+        let native = engine.opts.listing == scan::Listing::Native;
+        let mut queue = buckets.into_iter().flat_map(|b| {
+            let st = stats.remove(&b);
+            let shards = match (&st, native) {
+                (Some(st), true) => native::shard_units(st, args.sizing.shard_units_above),
+                _ => vec![None],
+            };
+            shards.into_iter().map(move |shard| (b.clone(), st.clone(), shard))
+        });
         loop {
             while tasks.len() < args.parallel.max(1) {
-                let Some(b) = queue.next() else { break };
-                let (engine, st) = (engine.clone(), stats.remove(&b));
+                let Some((b, st, shard)) = queue.next() else { break };
+                let engine = engine.clone();
                 tasks.spawn(async move {
-                    let r = engine.scan_bucket(&b, st).await;
-                    (b, r)
+                    let r = engine.scan_bucket_with(&b, st, Arc::default(), shard).await;
+                    (shard.map_or_else(|| b.clone(), |s| format!("{b}#{s}")), r)
                 });
             }
             let Some(done) = tasks.join_next().await else { break };
@@ -717,6 +760,7 @@ async fn server(args: ServerArgs) -> Result<()> {
         work_pool,
         partitions: args.sizing.orphan_partitions,
         slices: args.sizing.orphan_slices,
+        shard_units_above: args.sizing.shard_units_above,
         oidc: args.oidc.config()?,
         oidc_only: args.oidc.oidc_only,
         public_url: args.oidc.public_url.clone(),
@@ -762,6 +806,41 @@ async fn import(args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
+async fn list(args: ListArgs) -> Result<()> {
+    let engine = engine(&args.ceph, Options::default(), args.inflight, false).await?;
+    let mut rx = if args.radoslist {
+        native::radoslist_seeds(engine.admin.radoslist(&args.bucket))
+    } else {
+        let stats = engine.admin.bucket_stats(&args.bucket).await?;
+        if let Some(s) = args.shard.filter(|s| u64::from(*s) >= stats.num_shards.max(1)) {
+            anyhow::bail!("{} has {} shard(s); there is no shard {s}", args.bucket, stats.num_shards.max(1));
+        }
+        engine.native_seeds(stats, args.shard)
+    };
+    let sep = args.separator.replace("\\t", "\t");
+    let mut out = BufWriter::new(std::io::stdout());
+    let mut errors = 0;
+    while let Some(seed) = rx.recv().await {
+        let seed = seed?;
+        if let Some(e) = &seed.error {
+            tracing::error!("{e}");
+            errors += 1;
+        }
+        for oid in &seed.oids {
+            if seed.parts {
+                writeln!(out, "{oid}")?;
+            } else {
+                writeln!(out, "{oid}{sep}{}{sep}{}", seed.bucket, seed.key)?;
+            }
+        }
+    }
+    out.flush()?;
+    if errors > 0 {
+        anyhow::bail!("{errors} object(s) could not be listed in full");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -784,6 +863,7 @@ fn main() -> Result<()> {
             Cmd::Server(args) => server(args).await,
             Cmd::Client(args) => client(args).await,
             Cmd::Import(args) => import(args).await,
+            Cmd::List(args) => list(args).await,
         }
     })
 }

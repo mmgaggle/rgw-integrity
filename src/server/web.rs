@@ -1016,6 +1016,7 @@ fn options_form(o: &Options) -> Markup {
             (checkbox("check_index", "Index entries against heads (one read per object)", o.check_index))
             (checkbox("refcount", "Tail references (one read per tail object)", o.refcount))
             (checkbox("orphans", "Orphans (lists the data pools; every bucket)", o.orphans))
+            (checkbox("radoslist", "List with radosgw-admin radoslist (slower; a unit per bucket)", o.listing == crate::scan::Listing::Radoslist))
         }
     }
 }
@@ -1032,6 +1033,7 @@ fn options_of(f: &HashMap<String, String>) -> anyhow::Result<Options> {
         match_prefix: f.get("match_prefix").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         threads: num("threads", 32)?.clamp(1, 1024) as usize,
         orphans: f.contains_key("orphans"),
+        listing: if f.contains_key("radoslist") { crate::scan::Listing::Radoslist } else { crate::scan::Listing::Native },
     })
 }
 
@@ -1048,6 +1050,9 @@ fn checks_label(o: &Options) -> String {
     }
     if o.orphans {
         v.push("orphans");
+    }
+    if o.listing == crate::scan::Listing::Radoslist {
+        v.push("radoslist");
     }
     v.join(", ")
 }
@@ -1174,12 +1179,15 @@ async fn scan_page(AdminAuth(who): AdminAuth, State(app): State<Shared>, Path(id
                 (select("state", "Buckets", &states, state.as_deref().or(Some(""))))
                 button class="cds--btn cds--btn--ghost cds--btn--sm" type="submit" { "Show" }
             }
-            (table("", Some("Leased and failed first, then by size; up to 2000. Orphan joins wait for every bucket and pool slice."), &["Unit", "State", "Client", "Objects", "RADOS objects", "Findings", "Took", "Attempts", "Error"], html! {
+            (table("", Some("Leased and failed first, then by size; up to 2000. A big bucket is a unit per index shard. Orphan joins wait for every bucket and pool slice."), &["Unit", "State", "Client", "Objects", "RADOS objects", "Findings", "Took", "Attempts", "Error"], html! {
                 @for u in &units {
                     tr {
                         td {
                             @if u.kind == "bucket" {
                                 a class="cds--link" href=(format!("/findings?bucket={}&status=any", urlencode(&u.bucket))) { (u.bucket) }
+                            } @else if let (true, Some((bucket, shard))) = (u.kind == "shard", u.bucket.rsplit_once('#')) {
+                                a class="cds--link" href=(format!("/findings?bucket={}&status=any", urlencode(bucket))) { (bucket) }
+                                " " (tag("cyan", &format!("shard {shard}")))
                             } @else {
                                 (tag("cool-gray", match u.kind.as_str() { "list" => "pool slice", "join" => "orphan join", _ => "orphan classification" })) " " (u.bucket)
                             }

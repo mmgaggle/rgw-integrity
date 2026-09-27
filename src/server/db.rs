@@ -383,7 +383,24 @@ impl NewUnit {
     pub fn bucket(name: String, objects: u64, stats: Option<String>) -> NewUnit {
         NewUnit { label: name, kind: "bucket", objects, stats, spec: None, blocked: false }
     }
+
+    /// One index shard of a bucket, labelled bucket#shard ( no bucket name has a # )
+    pub fn shard(st: &crate::admin::BucketStats, shard: u32, stats: Option<String>) -> Result<NewUnit> {
+        let (bucket, shards) = (st.name(), st.num_shards.max(1) as u32);
+        let spec = crate::detect::ShardUnit { bucket: bucket.clone(), shard, shards };
+        Ok(NewUnit {
+            label: format!("{bucket}#{shard}"),
+            kind: "shard",
+            objects: st.num_objects() / shards as u64,
+            stats,
+            spec: Some(serde_json::to_string(&spec)?),
+            blocked: false,
+        })
+    }
 }
+
+/// The bucket a bucket or shard unit scans.
+const UNIT_BUCKET: &str = "CASE kind WHEN 'shard' THEN json_extract(spec, '$.bucket') ELSE bucket END";
 
 #[allow(clippy::too_many_arguments)]
 pub fn insert_scan(
@@ -451,7 +468,9 @@ pub fn scan_writers(c: &Connection, scan: i64) -> Result<Vec<String>> {
 
 /// The stats of the buckets a scan covers.
 pub fn scan_buckets(c: &Connection, scan: i64) -> Result<Vec<crate::admin::BucketStats>> {
-    let mut st = c.prepare("SELECT stats FROM units WHERE scan_id = ?1 AND kind = 'bucket' AND stats IS NOT NULL")?;
+    let mut st = c.prepare(&format!(
+        "SELECT MIN(stats) FROM units WHERE scan_id = ?1 AND kind IN ('bucket', 'shard') AND stats IS NOT NULL GROUP BY {UNIT_BUCKET}"
+    ))?;
     let rows = st.query_map([scan], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for s in rows {
@@ -762,7 +781,8 @@ pub fn finish_scan(c: &mut Connection, scan: i64, ctx: &crate::finding::Context,
         &format!(
             "UPDATE findings SET status = 'gone'
              WHERE status IN ('open', 'confirmed') AND check_name IN {BUCKET_CHECKS} AND COALESCE(last_scan, 0) < ?1
-               AND bucket IN (SELECT bucket FROM units WHERE scan_id = ?1 AND state = 'done')"
+               AND bucket IN (SELECT {UNIT_BUCKET} AS b FROM units WHERE scan_id = ?1 AND kind IN ('bucket', 'shard')
+                              GROUP BY b HAVING SUM(state != 'done') = 0)"
         ),
         [scan],
     )?;
@@ -972,6 +992,55 @@ mod tests {
         assert_eq!(rows[0].status, "gone");
         let f = db.call(|c| facets(c, &Filter::default())).await.unwrap();
         assert_eq!(f.tally.classes.get("data_loss"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn shard_units_mark_gone_together() {
+        // a finding of a sharded bucket is gone only once every shard's unit is done
+        let db = db();
+        let st: crate::admin::BucketStats =
+            serde_json::from_value(serde_json::json!({ "bucket": "big", "id": "i", "marker": "m", "num_shards": 3 })).unwrap();
+        let shards = |st: &crate::admin::BucketStats| (0..3).map(|s| NewUnit::shard(st, s, Some(serde_json::to_string(st).unwrap())).unwrap()).collect::<Vec<_>>();
+        let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
+        let (c2, units) = (ctx.clone(), shards(&st));
+        let scan = db.call(move |c| insert_scan(c, 1, &Options::default(), &c2, 7200, 0, "", None, &units)).await.unwrap();
+        let leased = db.call(|c| lease(c, "a", 5, 1, 60)).await.unwrap();
+        assert_eq!(leased.iter().map(|u| u.bucket.as_str()).collect::<std::collections::BTreeSet<_>>(), ["big#0", "big#1", "big#2"].into());
+        assert_eq!(db.call(move |c| scan_buckets(c, scan)).await.unwrap().len(), 1, "one bucket, not one per shard");
+        for (i, u) in leased.iter().enumerate() {
+            let (id, mut r) = (u.id, BucketReport::default());
+            if i == 0 {
+                r.findings.push(Finding::new(Class::DataLoss, "missing_data", "big").key("k"));
+            }
+            db.call(move |c| complete(c, scan, id, "a", &r, 2)).await.unwrap();
+        }
+        db.call(move |c| finish_scan(c, scan, &ctx, 3)).await.unwrap();
+
+        // the next scan does not find it, but one shard fails: not gone
+        let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
+        let (c2, units) = (ctx.clone(), shards(&st));
+        let scan2 = db.call(move |c| insert_scan(c, 10, &Options::default(), &c2, 7200, 0, "", None, &units)).await.unwrap();
+        let leased = db.call(|c| lease(c, "a", 5, 10, 60)).await.unwrap();
+        for (i, u) in leased.iter().enumerate() {
+            let id = u.id;
+            if i == 0 {
+                db.call(move |c| c.execute("UPDATE units SET state = 'failed' WHERE id = ?1", [id]).map_err(Into::into)).await.unwrap();
+            } else {
+                db.call(move |c| complete(c, scan2, id, "a", &BucketReport::default(), 11)).await.unwrap();
+            }
+        }
+        let (_, gone) = db.call(move |c| finish_scan(c, scan2, &ctx, 12)).await.unwrap();
+        assert_eq!(gone, 0);
+
+        // one that covers every shard does
+        let ctx = Context { catalog: Catalog::builtin(), ..Default::default() };
+        let (c2, units) = (ctx.clone(), shards(&st));
+        let scan3 = db.call(move |c| insert_scan(c, 20, &Options::default(), &c2, 7200, 0, "", None, &units)).await.unwrap();
+        for u in db.call(|c| lease(c, "a", 5, 20, 60)).await.unwrap() {
+            db.call(move |c| complete(c, scan3, u.id, "a", &BucketReport::default(), 21)).await.unwrap();
+        }
+        let (_, gone) = db.call(move |c| finish_scan(c, scan3, &ctx, 22)).await.unwrap();
+        assert_eq!(gone, 1);
     }
 
     #[tokio::test]

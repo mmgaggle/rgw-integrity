@@ -48,6 +48,8 @@ pub struct App {
     /// orphan detection's sizing, instead of the objects' count
     pub partitions: Option<u32>,
     pub slices: Option<usize>,
+    /// buckets of more objects are scanned a unit per index shard
+    pub shard_units_above: u64,
     pub oidc: Option<oidc::Oidc>,
     /// only single sign-on logs in to the dashboard, not the admin token
     pub oidc_only: bool,
@@ -212,7 +214,8 @@ impl App {
         })
     }
 
-    /// Start a scan: list the buckets, snapshot GC, and queue a unit per bucket.
+    /// Start a scan: list the buckets, snapshot GC, and queue a unit per
+    /// bucket, or per index shard of a big one.
     pub async fn start_scan(self: &Arc<Self>, req: StartScan, gc: bool) -> Result<i64> {
         let _starting = self.starting.lock().await;
         if let Some(id) = self.db.call(|c| db::running_scan(c)).await? {
@@ -225,35 +228,47 @@ impl App {
             bail!("finding orphans needs every bucket's references: scan every bucket, and every key");
         }
         let mut units = Vec::new();
+        let mut named = std::collections::HashSet::new();
+        let native = req.options.listing == crate::scan::Listing::Native;
         let mut rx = self.admin.all_bucket_stats();
         while let Some(st) = rx.recv().await {
             let st = st?;
             let name = st.name();
             if req.buckets.is_empty() || req.buckets.contains(&name) {
-                units.push(db::NewUnit::bucket(name, st.num_objects(), Some(serde_json::to_string(&st)?)));
+                let json = serde_json::to_string(&st)?;
+                let shards = if native { crate::native::shard_units(&st, self.shard_units_above) } else { vec![None] };
+                for shard in shards {
+                    units.push(match shard {
+                        None => db::NewUnit::bucket(name.clone(), st.num_objects(), Some(json.clone())),
+                        Some(s) => db::NewUnit::shard(&st, s, Some(json.clone()))?,
+                    });
+                }
+                named.insert(name);
             }
         }
         for b in &req.buckets {
-            if !units.iter().any(|u| &u.label == b) {
+            if !named.contains(b) {
                 units.push(db::NewUnit::bucket(b.clone(), 0, None));
+                named.insert(b.clone());
             }
         }
         if units.is_empty() {
             bail!("there are no buckets to scan");
         }
-        let buckets = units.len();
+        let (buckets, bucket_units) = (named.len(), units.len());
         let plan = if req.options.orphans { Some(self.plan_orphans(&mut units).await?) } else { None };
         let snapshot = if gc { Some(GcIndex::load(&self.admin).await?) } else { None };
         let entries = snapshot.as_ref().map_or(0, |g| g.entries);
         let (options, note) = (req.options.clone(), req.note.clone());
         let what = match &plan {
-            Some(p) => format!(", and orphans in {} partitions of {} pool slices", p.partitions, units.len() - buckets - p.partitions as usize),
+            Some(p) => format!(", and orphans in {} partitions of {} pool slices", p.partitions, units.len() - bucket_units - p.partitions as usize),
             None => String::new(),
         };
+        let shard_units = if bucket_units > buckets { format!(" in {bucket_units} units") } else { String::new() };
         let id = self.db.call(move |c| db::insert_scan(c, now(), &options, &ctx, gc_min_wait, entries, &note, plan.as_ref(), &units)).await?;
         let json = serde_json::to_vec(&snapshot.unwrap_or_default())?;
         *self.gc.write().unwrap() = Some((id, now(), Arc::new(json)));
-        self.event("scan", format!("scan {id} started: {buckets} buckets{what}, {entries} GC entries")).await;
+        self.event("scan", format!("scan {id} started: {buckets} buckets{shard_units}{what}, {entries} GC entries")).await;
         Ok(id)
     }
 
@@ -572,6 +587,7 @@ pub struct ServeOpts {
     pub work_pool: Option<String>,
     pub partitions: Option<u32>,
     pub slices: Option<usize>,
+    pub shard_units_above: u64,
     pub oidc: Option<oidc::OidcConfig>,
     pub oidc_only: bool,
     pub public_url: Option<String>,
@@ -597,6 +613,7 @@ pub async fn serve(opts: ServeOpts, admin: Arc<Admin>, store: Option<Arc<dyn Sto
         work_pool: opts.work_pool,
         partitions: opts.partitions,
         slices: opts.slices,
+        shard_units_above: opts.shard_units_above,
         oidc,
         oidc_only: opts.oidc_only,
         public_url: opts.public_url,

@@ -27,6 +27,14 @@ pub struct Plan {
     pub created: i64,
 }
 
+/// One index shard of a bucket, to scan as a unit of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardUnit {
+    pub bucket: String,
+    pub shard: u32,
+    pub shards: u32,
+}
+
 /// A slice of a data pool to list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Slice {

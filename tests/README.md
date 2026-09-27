@@ -19,6 +19,17 @@ of ceph/ceph#72096 ( build the `vstart` and `ceph-diff-sorted` targets ):
 CEPH_BUILD=~/ceph/build EXPECTED=gap-run/expected.json PYTHON=~/venv/bin/python tests/e2e.sh
 ```
 
+  `SHARD_UNITS_ABOVE=0` makes every bucket of several shards a unit per shard.
+- `seed_listing_corpus.py` fills buckets whose objects exercise the native
+  listing ( any vstart cluster: it needs no injection points ), and
+  `compare_listing.sh` lists every bucket natively, with radoslist, and a
+  shard at a time, and compares them object for object:
+
+  ```
+  CEPH_BUILD=~/ceph/build python tests/seed_listing_corpus.py
+  CEPH_BUILD=~/ceph/build tests/compare_listing.sh
+  ```
+
 - `oidc/`: single sign-on through Keycloak.  `keycloak.sh` runs one in
   podman with realm `rgwi` ( `realm.json` ): alice is in `rgw-admins`, bob is
   not.  Start a server on https://localhost:18443 with

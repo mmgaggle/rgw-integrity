@@ -220,7 +220,15 @@ async fn run_unit(se: Arc<ScanEngine>, http: Arc<Http>, writer: String, unit: &U
             })
         }
         _ => {
-            let mut r = se.engine.scan_bucket_with(&unit.bucket, unit.stats.clone(), progress).await?;
+            // a bucket, or one shard of it ( a shard unit's spec )
+            let (bucket, shard) = match (&unit.kind[..], &unit.spec) {
+                ("shard", Some(spec)) => {
+                    let s: crate::detect::ShardUnit = serde_json::from_value(spec.clone())?;
+                    (s.bucket, Some(s.shard))
+                }
+                _ => (unit.bucket.clone(), None),
+            };
+            let mut r = se.engine.scan_bucket_with(&bucket, unit.stats.clone(), progress, shard).await?;
             // the references must be in the partitions before the report says the bucket is done
             if let Some(refs) = r.references.take() {
                 let (_, shuffle) = se.detection()?;

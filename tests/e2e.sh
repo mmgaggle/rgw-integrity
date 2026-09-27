@@ -39,7 +39,7 @@ start_server() {
   "$BIN" server -v --listen 127.0.0.1:$PORT --tls-cert "$W/server.pem" --tls-key "$W/server.key" \
     --db ceph:rgw-integrity/$DB --cephsqlite "$B/lib/libcephsqlite.so" \
     --client-token-file "$W/client.token" --admin-token-file "$W/admin.token" \
-    --orphan-partitions "${PARTITIONS:-5}" --orphan-slices "${SLICES:-4}" >> "$W/server.log" 2>&1 &
+    --orphan-partitions "${PARTITIONS:-5}" --orphan-slices "${SLICES:-4}" --shard-units-above "${SHARD_UNITS_ABOVE:-100000}" >> "$W/server.log" 2>&1 &
   SERVER=$!
   for i in $(seq 60); do curl -s --cacert "$W/ca.pem" -o /dev/null "$URL/api/v1/status" && break; sleep 1; done
 }
@@ -96,7 +96,7 @@ check "each of two clients gets half of 10 in flight" '[ "$(api "$URL/api/v1/sta
 settings '.paused = true' >/dev/null
 SCAN=$(api -X POST -H 'Content-Type: application/json' --data '{"options": {"grace": 0, "check_index": false, "refcount": false, "uploads": true, "match_prefix": null, "threads": 16}, "buckets": ["gap-clean", "gap-atrisk"]}' "$URL/api/v1/scans?gc=false")
 sleep 12
-check "paused clients lease nothing" '[ "$(api "$URL/api/v1/status" | jq ".scans[] | select(.id == $SCAN) | .pending")" = 2 ]'
+check "paused clients lease nothing" '[ "$(api "$URL/api/v1/status" | jq ".scans[] | select(.id == $SCAN) | .units > 0 and .pending == .units")" = true ]'
 settings '.paused = false | .global_inflight = 1024' >/dev/null
 check "resumed, the scan finishes" 'wait_scan "$SCAN" 60'
 

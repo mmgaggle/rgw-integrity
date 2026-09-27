@@ -43,6 +43,8 @@ unsafe extern "C" {
     fn rados_ioctx_create(cluster: rados_t, pool: *const c_char, io: *mut rados_ioctx_t) -> c_int;
     fn rados_ioctx_destroy(io: rados_ioctx_t);
     fn rados_ioctx_set_namespace(io: rados_ioctx_t, ns: *const c_char);
+    fn rados_ioctx_locator_set_key(io: rados_ioctx_t, key: *const c_char);
+    fn rados_getxattr(io: rados_ioctx_t, oid: *const c_char, name: *const c_char, buf: *mut c_char, len: usize) -> c_int;
     fn rados_aio_create_completion2(arg: *mut c_void, cb: rados_callback_t, pc: *mut rados_completion_t) -> c_int;
     fn rados_aio_release(c: rados_completion_t);
     fn rados_aio_get_return_value(c: rados_completion_t) -> c_int;
@@ -60,6 +62,16 @@ unsafe extern "C" {
         prval: *mut c_int,
     );
     fn rados_read_op_operate(op: rados_read_op_t, io: rados_ioctx_t, oid: *const c_char, flags: c_int) -> c_int;
+    fn rados_read_op_exec(
+        op: rados_read_op_t,
+        cls: *const c_char,
+        method: *const c_char,
+        in_buf: *const c_char,
+        in_len: usize,
+        out_buf: *mut *mut c_char,
+        out_len: *mut usize,
+        prval: *mut c_int,
+    );
     fn rados_omap_get_next2(
         iter: rados_omap_iter_t,
         key: *mut *mut c_char,
@@ -316,6 +328,11 @@ impl IoCtx {
     /// The omap keys with a prefix, all pages; None if the object is missing.
     /// Blocking.
     pub fn omap_keys_blocking(&self, oid: &str, prefix: &str) -> Result<Option<Vec<String>>> {
+        Ok(self.omap_blocking(oid, prefix)?.map(|kv| kv.into_iter().map(|(k, _)| k).collect()))
+    }
+
+    /// The omap keys that start with a prefix, and their values.
+    pub fn omap_blocking(&self, oid: &str, prefix: &str) -> Result<Option<Vec<(String, Vec<u8>)>>> {
         let (o, p) = (cstr(oid)?, cstr(prefix)?);
         let mut keys = Vec::new();
         let mut start = CString::default();
@@ -341,13 +358,14 @@ impl IoCtx {
                     if rados_omap_get_next2(iter, &mut k, &mut v, &mut klen, &mut vlen) < 0 || k.is_null() {
                         break;
                     }
-                    page.push(std::slice::from_raw_parts(k as *const u8, klen).to_vec());
+                    let val = if v.is_null() { Vec::new() } else { std::slice::from_raw_parts(v as *const u8, vlen).to_vec() };
+                    page.push((std::slice::from_raw_parts(k as *const u8, klen).to_vec(), val));
                 }
                 rados_omap_get_end(iter);
                 rados_release_read_op(op);
             }
-            let last = page.last().cloned();
-            keys.extend(page.into_iter().map(|k| String::from_utf8_lossy(&k).into_owned()));
+            let last = page.last().map(|(k, _)| k.clone());
+            keys.extend(page.into_iter().map(|(k, v)| (String::from_utf8_lossy(&k).into_owned(), v)));
             match (more != 0, last) {
                 (true, Some(last)) if !last.contains(&0) => start = CString::new(last).expect("checked for NUL"),
                 _ => break,
@@ -411,6 +429,28 @@ impl IoCtx {
         Ok(listed)
     }
 
+    /// Call an object class method; None if the object does not exist.
+    pub fn exec_blocking(&self, oid: &str, cls: &str, method: &str, input: &[u8]) -> Result<Option<Vec<u8>>> {
+        let (o, c, m) = (cstr(oid)?, cstr(cls)?, cstr(method)?);
+        unsafe {
+            let op = rados_create_read_op();
+            let (mut out, mut out_len, mut prval): (*mut c_char, usize, c_int) = (null_mut(), 0, 0);
+            rados_read_op_exec(op, c.as_ptr(), m.as_ptr(), input.as_ptr() as *const c_char, input.len(), &mut out, &mut out_len, &mut prval);
+            let r = rados_read_op_operate(op, self.io, o.as_ptr(), 0);
+            let data = (!out.is_null()).then(|| std::slice::from_raw_parts(out as *const u8, out_len).to_vec());
+            if !out.is_null() {
+                rados_buffer_free(out);
+            }
+            rados_release_read_op(op);
+            if r == -libc::ENOENT {
+                return Ok(None);
+            }
+            let r = if r < 0 { r } else { prval };
+            check(r, || format!("{cls}.{method} on {oid} in {}", self.name))?;
+            Ok(Some(data.unwrap_or_default()))
+        }
+    }
+
     pub fn append_blocking(&self, oid: &str, data: &[u8]) -> Result<()> {
         let o = cstr(oid)?;
         let r = unsafe { rados_append(self.io, o.as_ptr(), data.as_ptr() as *const c_char, data.len()) };
@@ -448,6 +488,42 @@ impl IoCtx {
             check(r, || format!("removing {oid} in {}", self.name))?;
         }
         Ok(())
+    }
+}
+
+impl IoCtx {
+    /// An ioctx on the same pool whose operations use a locator.
+    fn with_locator(&self, cluster: &Arc<Cluster>, loc: &str) -> Result<IoCtx> {
+        let (pool, ns) = self.name.split_once(':').unwrap_or((&self.name, ""));
+        let io = cluster.ioctx_ns(pool, ns)?;
+        let key = cstr(loc)?;
+        unsafe { rados_ioctx_locator_set_key(io.io, key.as_ptr()) };
+        Arc::try_unwrap(io).map_err(|_| anyhow!("a fresh ioctx is shared"))
+    }
+
+    fn stat_blocking(&self, oid: &str) -> Result<(u64, i64), c_int> {
+        let Ok(o) = CString::new(oid) else { return Err(-libc::EINVAL) };
+        let (mut size, mut mtime) = (0u64, 0 as libc::time_t);
+        let r = unsafe { rados_stat(self.io, o.as_ptr(), &mut size, &mut mtime) };
+        if r < 0 { Err(r) } else { Ok((size, mtime as i64)) }
+    }
+
+    fn getxattr_blocking(&self, oid: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let (o, n) = (cstr(oid)?, cstr(name)?);
+        let mut len = 4096;
+        loop {
+            let mut buf = vec![0u8; len];
+            let r = unsafe { rados_getxattr(self.io, o.as_ptr(), n.as_ptr(), buf.as_mut_ptr() as *mut c_char, len) };
+            match r {
+                r if r >= 0 => {
+                    buf.truncate(r as usize);
+                    return Ok(Some(buf));
+                }
+                r if r == -libc::ENOENT || r == -libc::ENODATA => return Ok(None),
+                r if r == -libc::ERANGE && len < 64 << 20 => len *= 16,
+                r => bail!("getxattr {name} of {oid}: {}", std::io::Error::from_raw_os_error(-r)),
+            }
+        }
     }
 }
 
@@ -532,6 +608,28 @@ impl RadosStore {
         }
     }
 
+    /// Stat a head stored under a locator, in the data pools.
+    async fn stat_located(&self, oid: &str, loc: &str) -> Stat {
+        let mut error = None;
+        for &p in &self.data {
+            let io = match self.pools[p].with_locator(&self.cluster, loc) {
+                Ok(io) => io,
+                Err(e) => {
+                    tracing::error!("{e:#}");
+                    return Stat::Error(-libc::EIO);
+                }
+            };
+            let oid2 = oid.to_string();
+            match tokio::task::spawn_blocking(move || io.stat_blocking(&oid2)).await {
+                Ok(Ok((size, mtime))) => return Stat::Found { pool: PoolId(p), size, mtime },
+                Ok(Err(r)) if r != -libc::ENOENT => error = Some(r),
+                Ok(Err(_)) => {}
+                Err(_) => error = Some(-libc::EIO),
+            }
+        }
+        error.map_or(Stat::Missing, Stat::Error)
+    }
+
     fn index_ioctx(&self, placement: &str) -> Option<Arc<IoCtx>> {
         let mut index = self.index.lock().unwrap();
         index
@@ -547,6 +645,9 @@ impl RadosStore {
 #[async_trait]
 impl Store for RadosStore {
     async fn stat(&self, oid: &str) -> Stat {
+        if let Some(loc) = crate::oid::head_locator(oid) {
+            return self.stat_located(oid, &loc).await;
+        }
         // the first data pool holds most objects; look in the others only
         // when it lacks this one
         let first = self.data[0];
@@ -568,6 +669,12 @@ impl Store for RadosStore {
     }
 
     async fn find(&self, oid: &str, pools: Pools) -> Option<(PoolId, u64, i64)> {
+        if let Some(loc) = crate::oid::head_locator(oid) {
+            return match self.stat_located(oid, &loc).await {
+                Stat::Found { pool, size, mtime } => Some((pool, size, mtime)),
+                _ => None,
+            };
+        }
         for p in self.order(pools) {
             match self.pools[p].stat(oid).await {
                 Ok((size, mtime)) => return Some((PoolId(p), size, mtime)),
@@ -581,6 +688,11 @@ impl Store for RadosStore {
     }
 
     async fn getxattr(&self, pool: PoolId, oid: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(loc) = crate::oid::head_locator(oid) {
+            let io = self.pools[pool.0].with_locator(&self.cluster, &loc)?;
+            let (oid, name) = (oid.to_string(), name.to_string());
+            return tokio::task::spawn_blocking(move || io.getxattr_blocking(&oid, &name)).await?;
+        }
         self.pools[pool.0].getxattr(oid, name).await
     }
 
@@ -588,6 +700,18 @@ impl Store for RadosStore {
         let io = self.pools[pool.0].clone();
         let (oid, prefix) = (oid.to_string(), prefix.to_string());
         tokio::task::spawn_blocking(move || io.omap_keys_blocking(&oid, &prefix)).await?
+    }
+
+    async fn omap_vals(&self, pool: PoolId, oid: &str, prefix: &str) -> Result<Option<Vec<(String, Vec<u8>)>>> {
+        let io = self.pools[pool.0].clone();
+        let (oid, prefix) = (oid.to_string(), prefix.to_string());
+        tokio::task::spawn_blocking(move || io.omap_blocking(&oid, &prefix)).await?
+    }
+
+    async fn index_exec(&self, placement: &str, oid: &str, cls: &str, method: &str, input: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let io = self.index_ioctx(placement).with_context(|| format!("no index pool for placement {placement}"))?;
+        let (oid, cls, method) = (oid.to_string(), cls.to_string(), method.to_string());
+        tokio::task::spawn_blocking(move || io.exec_blocking(&oid, &cls, &method, &input)).await?
     }
 
     async fn index_keys(&self, placement: &str, oid: &str, prefix: &str) -> Result<Option<Vec<String>>> {

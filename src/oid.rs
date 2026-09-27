@@ -57,13 +57,23 @@ fn split_part(name: &str) -> Option<(&str, &str)> {
     (!upload.is_empty()).then_some((key, upload))
 }
 
+/// The name after a namespace prefix: `_<ns>_<name>`, or a version's
+/// `_<ns>:<instance>_<name>`.
+fn ns_name<'a>(rest: &'a str, ns: &str) -> Option<&'a str> {
+    let r = rest.strip_prefix('_')?.strip_prefix(ns)?;
+    if let Some(name) = r.strip_prefix('_') {
+        return Some(name);
+    }
+    r.strip_prefix(':')?.split_once('_').map(|(_, name)| name)
+}
+
 /// Split an RGW data object's name.  Bucket markers hold no underscore.
 pub fn parse_oid(oid: &str) -> Oid<'_> {
     let Some((marker, rest)) = oid.split_once('_') else {
         return Oid { marker: oid, kind: Kind::Other, key: None, upload: None };
     };
     let plain = |kind| Oid { marker, kind, key: None, upload: None };
-    if let Some(name) = rest.strip_prefix("_multipart_") {
+    if let Some(name) = ns_name(rest, "multipart") {
         if let Some((key, upload)) = split_meta(name) {
             return Oid { marker, kind: Kind::Meta, key: Some(key), upload: Some(upload) };
         }
@@ -72,7 +82,7 @@ pub fn parse_oid(oid: &str) -> Oid<'_> {
             None => plain(Kind::Part),
         };
     }
-    if let Some(name) = rest.strip_prefix("_shadow_") {
+    if let Some(name) = ns_name(rest, "shadow") {
         return match split_part(name) {
             Some((key, upload)) => Oid { marker, kind: Kind::MpShadow, key: Some(key), upload: Some(upload) },
             None => plain(Kind::Shadow),
@@ -116,6 +126,19 @@ pub fn head_key(rest: &str) -> (&str, &str) {
         return (&rest[1..], "");
     }
     (rest, "")
+}
+
+/// The RADOS locator of a head object, if it has one: RGW stores the head
+/// of a key that starts with '_' under the locator `<marker>_<key>`, so it
+/// can only be found with it.
+#[cfg_attr(not(feature = "ceph"), allow(dead_code))]
+pub fn head_locator(oid: &str) -> Option<String> {
+    let o = parse_oid(oid);
+    if o.kind != Kind::Head {
+        return None;
+    }
+    let (name, _) = head_key(&oid[o.marker.len() + 1..]);
+    name.starts_with('_').then(|| format!("{}_{name}", o.marker))
 }
 
 /// The names of a bucket's current index shard objects.
@@ -237,6 +260,10 @@ mod tests {
             (format!("{M}__multipart_a.b.{UP}.2"), Kind::Part, Some("a.b"), Some(UP)),
             (format!("{M}__shadow_a.b.{UP}.2_1"), Kind::MpShadow, Some("a.b"), Some(UP)),
             (format!("{M}__multipart_a.b.{UP}.meta"), Kind::Meta, Some("a.b"), Some(UP)),
+            // a versioned object's tail carries its instance
+            (format!("{M}__shadow:v1_.QmeTJR66RPFocC7r5-Uu_Tn4Kpp4X_1"), Kind::Shadow, None, None),
+            (format!("{M}__multipart:v1_a.{UP}.2"), Kind::Part, Some("a"), Some(UP)),
+            (format!("{M}__:v1_obj"), Kind::Head, None, None),
         ];
         for (oid, kind, key, upload) in cases {
             let o = parse_oid(&oid);
@@ -300,6 +327,15 @@ mod tests {
         assert!(!survives_gc(["src", "copy"], Some(&copy)));
         let retired = Refcount { refs: BTreeMap::from([(String::new(), true)]), retired: BTreeSet::from(["copy".into()]) };
         assert!(survives_gc(["copy"], Some(&retired)));
+    }
+
+    #[test]
+    fn locators() {
+        assert_eq!(head_locator(&format!("{M}___under")), Some(format!("{M}__under")));
+        assert_eq!(head_locator(&format!("{M}__:abc__under")), Some(format!("{M}__under")));
+        assert_eq!(head_locator(&format!("{M}_plain")), None);
+        assert_eq!(head_locator(&format!("{M}__shadow_.X_1")), None);
+        assert_eq!(head_locator(&format!("{M}__multipart_a.{UP}.meta")), None);
     }
 
     #[test]
